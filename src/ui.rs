@@ -1,5 +1,5 @@
 use eframe::egui;
-use nix::libc::{ioctl, winsize, TIOCSWINSZ};
+use nix::libc::{TIOCSWINSZ, ioctl, winsize};
 use std::os::fd::AsRawFd;
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -86,61 +86,58 @@ impl eframe::App for TerminalUI {
                 if response.clicked() {
                     ui.memory_mut(|memory| memory.request_focus(response.id));
                 }
-                let has_focus = response.has_focus();
 
-                if has_focus {
-                    let mut input_bytes = Vec::new();
-                    ctx.input(|input| {
-                        let mods = input.modifiers;
-                        for event in &input.events {
-                            match event {
-                                egui::Event::Text(text) => {
-                                    if !mods.ctrl {
-                                        input_bytes.extend_from_slice(text.as_bytes());
-                                    }
+                let mut input_bytes = Vec::new();
+                ctx.input(|input| {
+                    let mods = input.modifiers;
+                    for event in &input.events {
+                        match event {
+                            egui::Event::Text(text) => {
+                                if !mods.ctrl {
+                                    input_bytes.extend_from_slice(text.as_bytes());
                                 }
-                                egui::Event::Key {
-                                    key,
-                                    pressed,
-                                    modifiers,
-                                    ..
-                                } if *pressed => {
-                                    if *key == egui::Key::Escape {
-                                        input_bytes.push(0x1b);
-                                    } else if modifiers.ctrl {
-                                        match key {
-                                            egui::Key::C => input_bytes.push(0x03),
-                                            egui::Key::D => input_bytes.push(0x04),
-                                            _ => {}
-                                        }
-                                    } else {
-                                        match key {
-                                            egui::Key::Enter => input_bytes.push(b'\r'),
-                                            egui::Key::Backspace => input_bytes.push(0x7f),
-                                            egui::Key::Tab => input_bytes.push(b'\t'),
-                                            egui::Key::ArrowUp => {
-                                                input_bytes.extend_from_slice(b"\x1b[A")
-                                            }
-                                            egui::Key::ArrowDown => {
-                                                input_bytes.extend_from_slice(b"\x1b[B")
-                                            }
-                                            egui::Key::ArrowRight => {
-                                                input_bytes.extend_from_slice(b"\x1b[C")
-                                            }
-                                            egui::Key::ArrowLeft => {
-                                                input_bytes.extend_from_slice(b"\x1b[D")
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                                _ => {}
                             }
+                            egui::Event::Key {
+                                key,
+                                pressed,
+                                modifiers,
+                                ..
+                            } if *pressed => {
+                                if *key == egui::Key::Escape {
+                                    input_bytes.push(0x1b);
+                                } else if modifiers.ctrl {
+                                    match key {
+                                        egui::Key::C => input_bytes.push(0x03),
+                                        egui::Key::D => input_bytes.push(0x04),
+                                        _ => {}
+                                    }
+                                } else {
+                                    match key {
+                                        egui::Key::Enter => input_bytes.push(b'\r'),
+                                        egui::Key::Backspace => input_bytes.push(0x7f),
+                                        egui::Key::Tab => input_bytes.push(b'\t'),
+                                        egui::Key::ArrowUp => {
+                                            input_bytes.extend_from_slice(b"\x1b[A")
+                                        }
+                                        egui::Key::ArrowDown => {
+                                            input_bytes.extend_from_slice(b"\x1b[B")
+                                        }
+                                        egui::Key::ArrowRight => {
+                                            input_bytes.extend_from_slice(b"\x1b[C")
+                                        }
+                                        egui::Key::ArrowLeft => {
+                                            input_bytes.extend_from_slice(b"\x1b[D")
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
-                    });
-                    if !input_bytes.is_empty() {
-                        let _ = self.tx_input.send(input_bytes);
                     }
+                });
+                if !input_bytes.is_empty() {
+                    let _ = self.tx_input.send(input_bytes);
                 }
 
                 let painter = ui.painter_at(rect);
