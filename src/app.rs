@@ -1,4 +1,7 @@
 use eframe::egui;
+use egui::IconData;
+use image::GenericImageView;
+use std::sync::Arc;
 use nix::libc::{ioctl, setsid, TIOCSCTTY};
 use nix::pty::openpty;
 use nix::unistd::{read, write};
@@ -19,9 +22,30 @@ pub fn run() -> eframe::Result<()> {
     let slave_fd = pty_result.slave;
     let shell_pgid = spawn_shell(&slave_fd);
 
+    let icon_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icon.png");
+    let icon_data = if let Ok(img) = image::open(&icon_path) {
+        let rgba = img.to_rgba8();
+        let (width, height) = img.dimensions();
+        Some(Arc::new(IconData {
+            rgba: rgba.into_raw(),
+            width: width as u32,
+            height: height as u32,
+        }))
+    } else {
+        None
+    };
+
+    let mut viewport = egui::ViewportBuilder::default();
+    if let Some(icon) = icon_data {
+        viewport = viewport.with_icon(icon);
+    }
+
     eframe::run_native(
         "shitty",
-        eframe::NativeOptions::default(),
+        eframe::NativeOptions {
+            viewport,
+            ..Default::default()
+        },
         Box::new(|cc| {
             configure_visuals(cc);
             configure_fonts(cc);
