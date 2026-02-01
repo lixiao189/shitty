@@ -476,16 +476,14 @@ impl TerminalGrid {
     }
 
     fn set_scroll_region(&mut self, params: &Params) {
-        let mut top = Self::param(params, 0, 1) as usize;
-        let mut bottom = Self::param(params, 1, self.rows() as u16) as usize;
-        if top == 0 {
-            top = 1;
-        }
-        if bottom == 0 {
-            bottom = self.rows();
-        }
+        let top = Self::param(params, 0, 1).max(1) as usize;
+        let bottom = Self::param(params, 1, self.rows() as u16)
+            .max(1)
+            .min(self.rows() as u16) as usize;
+
         let top = top.saturating_sub(1).min(self.rows().saturating_sub(1));
         let bottom = bottom.saturating_sub(1).min(self.rows().saturating_sub(1));
+
         if top < bottom {
             self.scroll_top = top;
             self.scroll_bottom = bottom;
@@ -599,8 +597,7 @@ impl TerminalGrid {
             }
             b'J' => match Self::param(params, 0, 0) {
                 2 | 3 => {
-                    self.surface
-                        .add_change(Change::ClearScreen(current_bg));
+                    self.surface.add_change(Change::ClearScreen(current_bg));
                 }
                 0 => {
                     self.surface
@@ -608,8 +605,7 @@ impl TerminalGrid {
                 }
                 1 => {
                     // Minimal: clear full screen for "erase to start".
-                    self.surface
-                        .add_change(Change::ClearScreen(current_bg));
+                    self.surface.add_change(Change::ClearScreen(current_bg));
                 }
                 _ => {}
             },
@@ -708,10 +704,9 @@ impl TerminalGrid {
                 self.bold = false;
                 self.apply_effective_bold_color();
             }
-            // Ignore italic/underline/reverse and other style changes for now.
-            Sgr::Italic(_) | Sgr::Underline(_) | Sgr::Inverse(_) => {}
             Sgr::Foreground(spec) => self.apply_color_spec(spec, true),
             Sgr::Background(spec) => self.apply_color_spec(spec, false),
+            // Ignore other style changes (italic, underline, etc.)
             _ => {}
         }
 
@@ -809,20 +804,15 @@ impl TerminalGrid {
             .unwrap_or(default)
     }
 
+    #[inline]
     fn csi_count(params: &Params, idx: usize) -> usize {
-        let mut n = Self::param(params, idx, 1);
-        if n == 0 {
-            n = 1;
-        }
-        n as usize
+        Self::param(params, idx, 1).max(1) as usize
     }
 
+    #[inline]
     fn csi_position(params: &Params, idx: usize, max: usize) -> usize {
-        let mut v = Self::param(params, idx, 1);
-        if v == 0 {
-            v = 1;
-        }
-        (v as usize).saturating_sub(1).min(max)
+        let v = Self::param(params, idx, 1).max(1) as usize;
+        v.saturating_sub(1).min(max)
     }
 
     fn parse_csi_string(s: &str) -> Option<(u8, Params, bool)> {

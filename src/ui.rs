@@ -14,6 +14,8 @@ pub(crate) struct TerminalUI {
     master_fd: std::os::fd::OwnedFd,
     slave_fd: std::os::fd::OwnedFd,
     shell_pgid: pid_t,
+    // Cache cell size to avoid recalculating every frame
+    cached_cell_size: Option<(f32, f32)>,
 }
 
 impl TerminalUI {
@@ -32,16 +34,22 @@ impl TerminalUI {
             master_fd,
             slave_fd,
             shell_pgid,
+            cached_cell_size: None,
         }
     }
 
-    fn cell_size(&self, ctx: &egui::Context) -> (f32, f32) {
-        ctx.fonts_mut(|fonts| {
+    fn cell_size(&mut self, ctx: &egui::Context) -> (f32, f32) {
+        if let Some(size) = self.cached_cell_size {
+            return size;
+        }
+        let size = ctx.fonts_mut(|fonts| {
             (
                 fonts.glyph_width(&self.font_id, 'W'),
                 fonts.row_height(&self.font_id),
             )
-        })
+        });
+        self.cached_cell_size = Some(size);
+        size
     }
 }
 
@@ -132,35 +140,31 @@ impl eframe::App for TerminalUI {
                 let lines = self.grid.screen_lines();
                 let default_bg = self.grid.default_bg();
                 let default_attrs = termwiz::cell::CellAttributes::default();
+
+                // Cache font_id reference to avoid cloning in loop
+                let font_id = &self.font_id;
+
                 for (row, line) in lines.iter().enumerate() {
                     let mut col = 0usize;
                     while col < cols {
                         let cell_ref = line.get_cell(col);
                         let cell = cell_ref.map(|c| c.as_cell());
                         let (text, attrs, width) = if let Some(cell) = &cell {
-                            (
-                                cell.str(),
-                                cell.attrs(),
-                                cell.width().max(1) as usize,
-                            )
+                            (cell.str(), cell.attrs(), cell.width().max(1) as usize)
                         } else {
                             ("", &default_attrs, 1)
                         };
                         let (fg, bg) = self.grid.resolve_cell_colors(attrs);
                         let pos = grid_to_screen(origin, cell_w, cell_h, row, col);
-                        let rect =
-                            egui::Rect::from_min_size(pos, egui::vec2(cell_w * width as f32, cell_h));
+                        let rect = egui::Rect::from_min_size(
+                            pos,
+                            egui::vec2(cell_w * width as f32, cell_h),
+                        );
                         if bg != default_bg {
                             painter.rect_filled(rect, 0.0, bg);
                         }
                         if !text.is_empty() && text != " " {
-                            painter.text(
-                                pos,
-                                egui::Align2::LEFT_TOP,
-                                text,
-                                self.font_id.clone(),
-                                fg,
-                            );
+                            painter.text(pos, egui::Align2::LEFT_TOP, text, font_id.clone(), fg);
                         }
                         if self.grid.cell_underline(attrs) {
                             let y = pos.y + cell_h - 1.0;
@@ -204,7 +208,7 @@ impl eframe::App for TerminalUI {
                         cursor_pos,
                         egui::Align2::LEFT_TOP,
                         cursor_cell.as_ref().map(|cell| cell.str()).unwrap_or(" "),
-                        self.font_id.clone(),
+                        font_id.clone(),
                         cursor_fg,
                     );
                 }

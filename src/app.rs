@@ -1,7 +1,6 @@
 use eframe::egui;
 use egui::IconData;
 use image::GenericImageView;
-use std::sync::Arc;
 use nix::libc::{ioctl, setsid, TIOCSCTTY};
 use nix::pty::openpty;
 use nix::unistd::{read, write};
@@ -10,6 +9,7 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::sync::mpsc::channel;
+use std::sync::Arc;
 use std::thread;
 
 use crate::ui::TerminalUI;
@@ -84,12 +84,10 @@ fn configure_fonts(cc: &eframe::CreationContext<'_>) {
             "jbmono".to_string(),
             egui::FontData::from_owned(font_data).into(),
         );
+        // Only set monospace font family since this is a terminal
         fonts
             .families
             .insert(egui::FontFamily::Monospace, vec!["jbmono".to_string()]);
-        fonts
-            .families
-            .insert(egui::FontFamily::Proportional, vec!["jbmono".to_string()]);
         cc.egui_ctx.set_fonts(fonts);
     }
 }
@@ -120,7 +118,8 @@ fn spawn_pty_threads(
     ctx: egui::Context,
 ) {
     thread::spawn(move || loop {
-        let mut buffer = [0u8; 2048];
+        // Increased buffer size from 2048 to 8192 for better throughput
+        let mut buffer = [0u8; 8192];
         match read(master_read.as_fd(), &mut buffer) {
             Ok(0) => break,
             Ok(n) => {

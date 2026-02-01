@@ -3,6 +3,10 @@ use eframe::egui;
 pub(crate) const DEFAULT_FG: egui::Color32 = egui::Color32::WHITE;
 pub(crate) const DEFAULT_BG: egui::Color32 = egui::Color32::BLACK;
 
+// Lookup table for RGB levels used in xterm 256 color mode
+const RGB_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+
+#[inline]
 pub(crate) fn ansi_16_color(index: u8) -> egui::Color32 {
     match index {
         0 => egui::Color32::from_rgb(0, 0, 0),
@@ -24,6 +28,7 @@ pub(crate) fn ansi_16_color(index: u8) -> egui::Color32 {
     }
 }
 
+#[inline]
 pub(crate) fn xterm_256_color(index: u8) -> egui::Color32 {
     if index < 16 {
         return ansi_16_color(index);
@@ -33,8 +38,11 @@ pub(crate) fn xterm_256_color(index: u8) -> egui::Color32 {
         let r = idx / 36;
         let g = (idx / 6) % 6;
         let b = idx % 6;
-        let levels = [0u8, 95, 135, 175, 215, 255];
-        return egui::Color32::from_rgb(levels[r as usize], levels[g as usize], levels[b as usize]);
+        return egui::Color32::from_rgb(
+            RGB_LEVELS[r as usize],
+            RGB_LEVELS[g as usize],
+            RGB_LEVELS[b as usize],
+        );
     }
     let gray = 8u8.saturating_add((index - 232).saturating_mul(10));
     egui::Color32::from_rgb(gray, gray, gray)
