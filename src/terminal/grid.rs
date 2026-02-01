@@ -1,14 +1,41 @@
 use eframe::egui;
 use unicode_width::UnicodeWidthChar;
+use vte::{Params, Perform};
 
 use crate::terminal::color::{
     ansi_16_color, parse_color_spec, xterm_256_color, ColorKind, DEFAULT_BG, DEFAULT_FG,
 };
-use crate::terminal::parser::{
-    map_dec_special, Charset, CharsetSlot, CsiParser, ParserState, StringKind, StringParser,
-};
 
 const TAB_SIZE: usize = 8;
+
+#[derive(Clone, Copy)]
+enum Charset {
+    Ascii,
+    DecSpecial,
+}
+
+fn map_dec_special(ch: char) -> char {
+    match ch {
+        'j' => '┘',
+        'k' => '┐',
+        'l' => '┌',
+        'm' => '└',
+        'n' => '┼',
+        'q' => '─',
+        't' => '├',
+        'u' => '┤',
+        'v' => '┴',
+        'w' => '┬',
+        'x' => '│',
+        'y' => '≤',
+        'z' => '≥',
+        '{' => 'π',
+        '|' => '≠',
+        '}' => '£',
+        '~' => '·',
+        _ => ch,
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct Cell {
@@ -63,8 +90,7 @@ pub(crate) struct TerminalGrid {
     in_alt: bool,
     cursor_visible: bool,
     saved_cursor_1049: Option<(usize, usize)>,
-    parser: ParserState,
-    utf8_buf: Vec<u8>,
+    parser: vte::Parser,
     cur_fg_kind: ColorKind,
     cur_bg_kind: ColorKind,
     cur_bold: bool,
@@ -102,8 +128,7 @@ impl TerminalGrid {
             in_alt: false,
             cursor_visible: true,
             saved_cursor_1049: None,
-            parser: ParserState::Ground,
-            utf8_buf: Vec::new(),
+            parser: vte::Parser::new(),
             cur_fg_kind: ColorKind::Default,
             cur_bg_kind: ColorKind::Default,
             cur_bold: false,
@@ -168,9 +193,11 @@ impl TerminalGrid {
     }
 
     pub(crate) fn write_bytes(&mut self, bytes: &[u8]) {
+        let mut parser = std::mem::replace(&mut self.parser, vte::Parser::new());
         for &byte in bytes {
-            self.write_byte(byte);
+            parser.advance(self, byte);
         }
+        self.parser = parser;
     }
 
     pub(crate) fn cell_at(&self, row: usize, col: usize) -> Cell {
@@ -250,15 +277,16 @@ impl TerminalGrid {
         if self.use_g1 { self.g1 } else { self.g0 }
     }
 
-    fn select_charset(&mut self, slot: CharsetSlot, designator: u8) {
+    fn select_charset(&mut self, slot: u8, designator: u8) {
         let set = match designator {
             b'0' => Charset::DecSpecial,
             b'B' => Charset::Ascii,
             _ => Charset::Ascii,
         };
         match slot {
-            CharsetSlot::G0 => self.g0 = set,
-            CharsetSlot::G1 => self.g1 = set,
+            b'(' => self.g0 = set,
+            b')' => self.g1 = set,
+            _ => {}
         }
     }
 
@@ -430,183 +458,6 @@ impl TerminalGrid {
         }
     }
 
-    fn write_byte(&mut self, byte: u8) {
-        let state = std::mem::replace(&mut self.parser, ParserState::Ground);
-        let next_state = match state {
-            ParserState::Ground => match byte {
-                0x1b => ParserState::Escape,
-                0x9b => ParserState::Csi(CsiParser::new()),
-                0x9d => ParserState::String(StringParser::new(StringKind::Osc)),
-                0x90 => ParserState::String(StringParser::new(StringKind::Dcs)),
-                0x98 => ParserState::String(StringParser::new(StringKind::Sos)),
-                0x9e => ParserState::String(StringParser::new(StringKind::Pm)),
-                0x9f => ParserState::String(StringParser::new(StringKind::Apc)),
-                0x0e => {
-                    self.use_g1 = true;
-                    ParserState::Ground
-                }
-                0x0f => {
-                    self.use_g1 = false;
-                    ParserState::Ground
-                }
-                0x08 => {
-                    self.backspace();
-                    ParserState::Ground
-                }
-                0x09 => {
-                    self.tab();
-                    ParserState::Ground
-                }
-                0x0a => {
-                    self.newline();
-                    ParserState::Ground
-                }
-                0x0d => {
-                    self.carriage_return();
-                    ParserState::Ground
-                }
-                0x07 | 0x00 => ParserState::Ground,
-                b if b >= 0x20 && b <= 0x7e => {
-                    let ch = self.map_charset_char(b as char);
-                    self.put_char(ch);
-                    ParserState::Ground
-                }
-                _ => {
-                    self.handle_utf8(byte);
-                    ParserState::Ground
-                }
-            },
-            ParserState::Escape => {
-                if byte == b'[' {
-                    ParserState::Csi(CsiParser::new())
-                } else if byte == b'(' {
-                    ParserState::EscCharset(CharsetSlot::G0)
-                } else if byte == b')' {
-                    ParserState::EscCharset(CharsetSlot::G1)
-                } else if byte == b']' {
-                    ParserState::String(StringParser::new(StringKind::Osc))
-                } else if byte == b'P' {
-                    ParserState::String(StringParser::new(StringKind::Dcs))
-                } else if byte == b'^' {
-                    ParserState::String(StringParser::new(StringKind::Pm))
-                } else if byte == b'_' {
-                    ParserState::String(StringParser::new(StringKind::Apc))
-                } else if byte == b'X' {
-                    ParserState::String(StringParser::new(StringKind::Sos))
-                } else if byte == b'D' {
-                    self.newline();
-                    ParserState::Ground
-                } else if byte == b'M' {
-                    if self.cursor_row <= self.scroll_top {
-                        self.scroll_down(1);
-                    } else {
-                        self.cursor_row = self.cursor_row.saturating_sub(1);
-                    }
-                    ParserState::Ground
-                } else if byte == b'E' {
-                    self.newline();
-                    self.carriage_return();
-                    ParserState::Ground
-                } else if byte == b'c' {
-                    self.reset();
-                    ParserState::Ground
-                } else if byte == b'7' {
-                    self.saved_cursor = (self.cursor_row, self.cursor_col);
-                    ParserState::Ground
-                } else if byte == b'8' {
-                    let (row, col) = self.saved_cursor;
-                    self.cursor_row = row.min(self.rows - 1);
-                    self.cursor_col = col.min(self.cols - 1);
-                    ParserState::Ground
-                } else {
-                    ParserState::Ground
-                }
-            }
-            ParserState::EscCharset(slot) => {
-                self.select_charset(slot, byte);
-                ParserState::Ground
-            }
-            ParserState::String(mut parser) => {
-                if parser.esc {
-                    parser.esc = false;
-                    if byte == b'\\' {
-                        if let StringKind::Osc = parser.kind {
-                            self.handle_osc(&parser.buf);
-                        }
-                        ParserState::Ground
-                    } else {
-                        if parser.buf.len() < 8192 {
-                            parser.buf.push(0x1b);
-                            parser.buf.push(byte);
-                        }
-                        ParserState::String(parser)
-                    }
-                } else if byte == 0x1b {
-                    parser.esc = true;
-                    ParserState::String(parser)
-                } else if byte == 0x07 {
-                    if let StringKind::Osc = parser.kind {
-                        self.handle_osc(&parser.buf);
-                    }
-                    ParserState::Ground
-                } else if byte == 0x9c {
-                    if let StringKind::Osc = parser.kind {
-                        self.handle_osc(&parser.buf);
-                    }
-                    ParserState::Ground
-                } else {
-                    if parser.buf.len() < 8192 {
-                        parser.buf.push(byte);
-                    }
-                    ParserState::String(parser)
-                }
-            }
-            ParserState::Csi(mut parser) => {
-                if byte == b'?' {
-                    parser.private = true;
-                    ParserState::Csi(parser)
-                } else if byte.is_ascii_digit() {
-                    let digit = (byte - b'0') as u16;
-                    parser.current = Some(
-                        parser
-                            .current
-                            .unwrap_or(0)
-                            .saturating_mul(10)
-                            .saturating_add(digit),
-                    );
-                    ParserState::Csi(parser)
-                } else if byte == b';' || byte == b':' {
-                    parser.push_current();
-                    ParserState::Csi(parser)
-                } else if (0x40..=0x7e).contains(&byte) {
-                    if parser.current.is_some() {
-                        parser.push_current();
-                    }
-                    self.execute_csi(byte, &parser);
-                    ParserState::Ground
-                } else {
-                    ParserState::Csi(parser)
-                }
-            }
-        };
-        self.parser = next_state;
-    }
-
-    fn handle_utf8(&mut self, byte: u8) {
-        self.utf8_buf.push(byte);
-        if self.utf8_buf.len() > 4 {
-            self.utf8_buf.clear();
-            return;
-        }
-        if let Ok(text) = std::str::from_utf8(&self.utf8_buf) {
-            let chars: Vec<char> = text.chars().collect();
-            self.utf8_buf.clear();
-            for ch in chars {
-                self.put_char(ch);
-            }
-        }
-    }
-
     fn insert_lines(&mut self, n: usize) {
         if self.cursor_row < self.scroll_top || self.cursor_row > self.scroll_bottom {
             return;
@@ -709,94 +560,102 @@ impl TerminalGrid {
         }
     }
 
-    fn csi_count(parser: &CsiParser, idx: usize) -> usize {
-        let mut n = parser.param(idx, 1);
+    fn param(params: &Params, idx: usize, default: u16) -> u16 {
+        params
+            .iter()
+            .nth(idx)
+            .and_then(|p| p.first().copied())
+            .unwrap_or(default)
+    }
+
+    fn csi_count(params: &Params, idx: usize) -> usize {
+        let mut n = Self::param(params, idx, 1);
         if n == 0 {
             n = 1;
         }
         n as usize
     }
 
-    fn csi_position(parser: &CsiParser, idx: usize, max: usize) -> usize {
-        let mut v = parser.param(idx, 1);
+    fn csi_position(params: &Params, idx: usize, max: usize) -> usize {
+        let mut v = Self::param(params, idx, 1);
         if v == 0 {
             v = 1;
         }
         (v as usize).saturating_sub(1).min(max)
     }
 
-    fn execute_csi(&mut self, final_byte: u8, parser: &CsiParser) {
+    fn execute_csi(&mut self, final_byte: u8, params: &Params, private: bool) {
         match final_byte {
             b'A' => {
-                let n = Self::csi_count(parser, 0);
+                let n = Self::csi_count(params, 0);
                 self.cursor_row = self.cursor_row.saturating_sub(n);
             }
             b'B' => {
-                let n = Self::csi_count(parser, 0);
+                let n = Self::csi_count(params, 0);
                 self.cursor_row = (self.cursor_row + n).min(self.rows - 1);
             }
             b'C' => {
-                let n = Self::csi_count(parser, 0);
+                let n = Self::csi_count(params, 0);
                 self.cursor_col = (self.cursor_col + n).min(self.cols - 1);
             }
             b'D' => {
-                let n = Self::csi_count(parser, 0);
+                let n = Self::csi_count(params, 0);
                 self.cursor_col = self.cursor_col.saturating_sub(n);
             }
             b'E' => {
-                let n = Self::csi_count(parser, 0);
+                let n = Self::csi_count(params, 0);
                 self.next_line(n);
             }
             b'F' => {
-                let n = Self::csi_count(parser, 0);
+                let n = Self::csi_count(params, 0);
                 self.prev_line(n);
             }
             b'G' => {
-                let col = Self::csi_position(parser, 0, self.cols - 1);
+                let col = Self::csi_position(params, 0, self.cols - 1);
                 self.cursor_col = col;
             }
             b'd' => {
-                let row = Self::csi_position(parser, 0, self.rows - 1);
+                let row = Self::csi_position(params, 0, self.rows - 1);
                 self.cursor_row = row;
             }
             b'H' | b'f' => {
-                let row = Self::csi_position(parser, 0, self.rows - 1);
-                let col = Self::csi_position(parser, 1, self.cols - 1);
+                let row = Self::csi_position(params, 0, self.rows - 1);
+                let col = Self::csi_position(params, 1, self.cols - 1);
                 self.cursor_row = row;
                 self.cursor_col = col;
             }
             b'@' => {
-                let n = Self::csi_count(parser, 0);
+                let n = Self::csi_count(params, 0);
                 self.insert_chars(n);
             }
             b'P' => {
-                let n = Self::csi_count(parser, 0);
+                let n = Self::csi_count(params, 0);
                 self.delete_chars(n);
             }
             b'X' => {
-                let n = Self::csi_count(parser, 0);
+                let n = Self::csi_count(params, 0);
                 self.erase_chars(n);
             }
-            b'J' => self.erase_display(parser.param(0, 0)),
-            b'K' => self.erase_line(parser.param(0, 0)),
+            b'J' => self.erase_display(Self::param(params, 0, 0)),
+            b'K' => self.erase_line(Self::param(params, 0, 0)),
             b'L' => {
-                let n = Self::csi_count(parser, 0);
+                let n = Self::csi_count(params, 0);
                 self.insert_lines(n);
             }
             b'M' => {
-                let n = Self::csi_count(parser, 0);
+                let n = Self::csi_count(params, 0);
                 self.delete_lines(n);
             }
             b'S' => {
-                let n = Self::csi_count(parser, 0);
+                let n = Self::csi_count(params, 0);
                 self.scroll_up(n);
             }
             b'T' => {
-                let n = Self::csi_count(parser, 0);
+                let n = Self::csi_count(params, 0);
                 self.scroll_down(n);
             }
             b'b' => {
-                let n = Self::csi_count(parser, 0);
+                let n = Self::csi_count(params, 0);
                 self.repeat_last(n);
             }
             b's' => self.saved_cursor = (self.cursor_row, self.cursor_col),
@@ -805,29 +664,31 @@ impl TerminalGrid {
                 self.cursor_row = row.min(self.rows - 1);
                 self.cursor_col = col.min(self.cols - 1);
             }
-            b'r' => self.set_scroll_region(parser),
-            b'm' => self.apply_sgr(&parser.params),
+            b'r' => self.set_scroll_region(params),
+            b'm' => self.apply_sgr(params),
             b'h' | b'l' => {
-                if parser.private {
+                if private {
                     let set = final_byte == b'h';
-                    for &param in &parser.params {
-                        match param {
-                            25 => self.cursor_visible = set,
-                            47 | 1047 => {
-                                if set {
-                                    self.enter_alternate(false, false);
-                                } else {
-                                    self.exit_alternate(false);
+                    for param in params.iter() {
+                        if let Some(&p) = param.first() {
+                            match p {
+                                25 => self.cursor_visible = set,
+                                47 | 1047 => {
+                                    if set {
+                                        self.enter_alternate(false, false);
+                                    } else {
+                                        self.exit_alternate(false);
+                                    }
                                 }
-                            }
-                            1049 => {
-                                if set {
-                                    self.enter_alternate(true, true);
-                                } else {
-                                    self.exit_alternate(true);
+                                1049 => {
+                                    if set {
+                                        self.enter_alternate(true, true);
+                                    } else {
+                                        self.exit_alternate(true);
+                                    }
                                 }
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
                 }
@@ -913,14 +774,15 @@ impl TerminalGrid {
         self.cur_inverse = false;
     }
 
-    fn apply_sgr(&mut self, params: &[u16]) {
+    fn apply_sgr(&mut self, params: &Params) {
         if params.is_empty() {
             self.reset_attributes();
             return;
         }
         let mut i = 0;
-        while i < params.len() {
-            match params[i] {
+        let params_vec: Vec<u16> = params.iter().filter_map(|p| p.first().copied()).collect();
+        while i < params_vec.len() {
+            match params_vec[i] {
                 0 => self.reset_attributes(),
                 // Ignore bold/italic so output stays regular.
                 1 | 3 => {}
@@ -930,16 +792,16 @@ impl TerminalGrid {
                 24 => self.cur_underline = false,
                 27 => self.cur_inverse = false,
                 30..=37 => {
-                    self.cur_fg_kind = ColorKind::Ansi((params[i] - 30) as u8);
+                    self.cur_fg_kind = ColorKind::Ansi((params_vec[i] - 30) as u8);
                 }
                 40..=47 => {
-                    self.cur_bg_kind = ColorKind::Ansi((params[i] - 40) as u8);
+                    self.cur_bg_kind = ColorKind::Ansi((params_vec[i] - 40) as u8);
                 }
                 90..=97 => {
-                    self.cur_fg_kind = ColorKind::Ansi((params[i] - 90 + 8) as u8);
+                    self.cur_fg_kind = ColorKind::Ansi((params_vec[i] - 90 + 8) as u8);
                 }
                 100..=107 => {
-                    self.cur_bg_kind = ColorKind::Ansi((params[i] - 100 + 8) as u8);
+                    self.cur_bg_kind = ColorKind::Ansi((params_vec[i] - 100 + 8) as u8);
                 }
                 39 => {
                     self.cur_fg_kind = ColorKind::Default;
@@ -948,21 +810,21 @@ impl TerminalGrid {
                     self.cur_bg_kind = ColorKind::Default;
                 }
                 38 | 48 => {
-                    let is_fg = params[i] == 38;
-                    if i + 1 < params.len() {
-                        match params[i + 1] {
-                            5 if i + 2 < params.len() => {
+                    let is_fg = params_vec[i] == 38;
+                    if i + 1 < params_vec.len() {
+                        match params_vec[i + 1] {
+                            5 if i + 2 < params_vec.len() => {
                                 if is_fg {
-                                    self.cur_fg_kind = ColorKind::Xterm(params[i + 2] as u8);
+                                    self.cur_fg_kind = ColorKind::Xterm(params_vec[i + 2] as u8);
                                 } else {
-                                    self.cur_bg_kind = ColorKind::Xterm(params[i + 2] as u8);
+                                    self.cur_bg_kind = ColorKind::Xterm(params_vec[i + 2] as u8);
                                 }
                                 i += 2;
                             }
-                            2 if i + 4 < params.len() => {
-                                let r = params[i + 2] as u8;
-                                let g = params[i + 3] as u8;
-                                let b = params[i + 4] as u8;
+                            2 if i + 4 < params_vec.len() => {
+                                let r = params_vec[i + 2] as u8;
+                                let g = params_vec[i + 3] as u8;
+                                let b = params_vec[i + 4] as u8;
                                 if is_fg {
                                     self.cur_fg_kind =
                                         ColorKind::Rgb(egui::Color32::from_rgb(r, g, b));
@@ -982,9 +844,9 @@ impl TerminalGrid {
         }
     }
 
-    fn set_scroll_region(&mut self, parser: &CsiParser) {
-        let mut top = parser.param(0, 1) as usize;
-        let mut bottom = parser.param(1, self.rows as u16) as usize;
+    fn set_scroll_region(&mut self, params: &Params) {
+        let mut top = Self::param(params, 0, 1) as usize;
+        let mut bottom = Self::param(params, 1, self.rows as u16) as usize;
         if top == 0 {
             top = 1;
         }
@@ -1073,7 +935,6 @@ impl TerminalGrid {
         self.scroll_top = 0;
         self.scroll_bottom = self.rows - 1;
         self.last_printable = None;
-        self.utf8_buf.clear();
         self.default_fg = DEFAULT_FG;
         self.default_bg = DEFAULT_BG;
         self.cursor_color = None;
@@ -1130,44 +991,82 @@ impl TerminalGrid {
             ColorKind::Rgb(color) => color,
         }
     }
+}
 
-    fn handle_osc(&mut self, data: &[u8]) {
-        let Ok(text) = std::str::from_utf8(data) else {
+impl Perform for TerminalGrid {
+    fn print(&mut self, c: char) {
+        let ch = self.map_charset_char(c);
+        self.put_char(ch);
+    }
+
+    fn execute(&mut self, byte: u8) {
+        match byte {
+            0x08 => self.backspace(),
+            0x09 => self.tab(),
+            0x0a => self.newline(),
+            0x0d => self.carriage_return(),
+            0x0e => self.use_g1 = true,
+            0x0f => self.use_g1 = false,
+            _ => {}
+        }
+    }
+
+    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _c: char) {}
+
+    fn put(&mut self, _byte: u8) {}
+
+    fn unhook(&mut self) {}
+
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if params.is_empty() {
             return;
-        };
-        let mut parts = text.split(';');
-        let cmd = match parts.next() {
-            Some(cmd) => cmd.trim(),
-            None => return,
+        }
+        let Ok(cmd) = std::str::from_utf8(params[0]) else {
+            return;
         };
         let Ok(cmd_num) = cmd.parse::<u16>() else {
             return;
         };
+
         match cmd_num {
             0 | 2 => {}
             4 => {
-                let rest: Vec<&str> = parts.collect();
-                let iter = rest.chunks(2);
-                for pair in iter {
-                    if pair.len() < 2 {
-                        break;
-                    }
-                    let Ok(idx) = pair[0].parse::<usize>() else {
+                if params.len() < 2 {
+                    return;
+                }
+                let mut i = 1;
+                while i + 1 < params.len() {
+                    let Ok(idx_str) = std::str::from_utf8(params[i]) else {
+                        i += 2;
+                        continue;
+                    };
+                    let Ok(idx) = idx_str.parse::<usize>() else {
+                        i += 2;
                         continue;
                     };
                     if idx >= 256 {
+                        i += 2;
                         continue;
                     }
-                    if pair[1] == "?" {
+                    let Ok(spec) = std::str::from_utf8(params[i + 1]) else {
+                        i += 2;
+                        continue;
+                    };
+                    if spec == "?" {
+                        i += 2;
                         continue;
                     }
-                    if let Some(color) = parse_color_spec(pair[1]) {
+                    if let Some(color) = parse_color_spec(spec) {
                         self.palette[idx] = Some(color);
                     }
+                    i += 2;
                 }
             }
             10..=12 => {
-                let Some(spec) = parts.next() else {
+                if params.len() < 2 {
+                    return;
+                }
+                let Ok(spec) = std::str::from_utf8(params[1]) else {
                     return;
                 };
                 if spec == "?" {
@@ -1183,14 +1082,17 @@ impl TerminalGrid {
                 }
             }
             104 => {
-                let rest: Vec<&str> = parts.collect();
-                if rest.is_empty() {
+                if params.len() < 2 {
                     self.palette = [None; 256];
                 } else {
-                    for item in rest {
-                        if let Ok(idx) = item.parse::<usize>()
-                            && idx < 256
-                        {
+                    for item in &params[1..] {
+                        let Ok(idx_str) = std::str::from_utf8(item) else {
+                            continue;
+                        };
+                        let Ok(idx) = idx_str.parse::<usize>() else {
+                            continue;
+                        };
+                        if idx < 256 {
                             self.palette[idx] = None;
                         }
                     }
@@ -1199,6 +1101,51 @@ impl TerminalGrid {
             110 => self.default_fg = DEFAULT_FG,
             111 => self.default_bg = DEFAULT_BG,
             112 => self.cursor_color = None,
+            _ => {}
+        }
+    }
+
+    fn csi_dispatch(
+        &mut self,
+        params: &Params,
+        intermediates: &[u8],
+        ignore: bool,
+        c: char,
+    ) {
+        if ignore {
+            return;
+        }
+        
+        // Check if this is a private mode (prefixed with '?')
+        let private = !intermediates.is_empty() && intermediates[0] == b'?';
+        
+        self.execute_csi(c as u8, params, private);
+    }
+
+    fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        match (intermediates, byte) {
+            ([], b'D') => self.newline(),
+            ([], b'M') => {
+                if self.cursor_row <= self.scroll_top {
+                    self.scroll_down(1);
+                } else {
+                    self.cursor_row = self.cursor_row.saturating_sub(1);
+                }
+            }
+            ([], b'E') => {
+                self.newline();
+                self.carriage_return();
+            }
+            ([], b'c') => self.reset(),
+            ([], b'7') => self.saved_cursor = (self.cursor_row, self.cursor_col),
+            ([], b'8') => {
+                let (row, col) = self.saved_cursor;
+                self.cursor_row = row.min(self.rows - 1);
+                self.cursor_col = col.min(self.cols - 1);
+            }
+            ([i], designator) if *i == b'(' || *i == b')' => {
+                self.select_charset(*i, designator);
+            }
             _ => {}
         }
     }

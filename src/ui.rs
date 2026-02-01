@@ -1,5 +1,5 @@
-use eframe::egui::{self, EventFilter};
-use nix::libc::{killpg, pid_t, tcgetpgrp, TIOCSWINSZ, SIGWINCH, ioctl, winsize};
+use eframe::egui::{self};
+use nix::libc::{ioctl, killpg, pid_t, tcgetpgrp, winsize, SIGWINCH, TIOCSWINSZ};
 use std::os::fd::AsRawFd;
 use std::sync::mpsc::{Receiver, Sender};
 
