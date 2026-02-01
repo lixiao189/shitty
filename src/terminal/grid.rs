@@ -1,11 +1,11 @@
 use eframe::egui;
 use termwiz::cell::{CellAttributes, Intensity, Underline};
 use termwiz::color::{ColorAttribute, ColorSpec, SrgbaTuple};
-use termwiz::escape::csi::{CSI, Sgr};
+use termwiz::escape::csi::{Sgr, CSI};
 use termwiz::escape::osc::{ColorOrQuery, DynamicColorNumber};
-use termwiz::escape::{Action, ControlCode, Esc, EscCode, OperatingSystemCommand};
 use termwiz::escape::parser::Parser;
-use termwiz::surface::{Change, CursorVisibility, Line, Position, Surface};
+use termwiz::escape::{Action, ControlCode, Esc, EscCode, OperatingSystemCommand};
+use termwiz::surface::{Change, CursorVisibility, Line, Position, SequenceNo, Surface, SEQ_ZERO};
 
 use crate::terminal::color::{xterm_256_color, DEFAULT_BG, DEFAULT_FG};
 
@@ -64,6 +64,7 @@ pub(crate) struct TerminalGrid {
     g0: Charset,
     g1: Charset,
     use_g1: bool,
+    last_rendered_seqno: SequenceNo,
 }
 
 impl TerminalGrid {
@@ -92,6 +93,7 @@ impl TerminalGrid {
             g0: Charset::Ascii,
             g1: Charset::Ascii,
             use_g1: false,
+            last_rendered_seqno: SEQ_ZERO,
         }
     }
 
@@ -143,11 +145,24 @@ impl TerminalGrid {
         self.parser = parser;
     }
 
+    /// Check if there are any changes since the last render
+    pub(crate) fn has_changes(&self) -> bool {
+        self.surface.has_changes(self.last_rendered_seqno)
+    }
+
+    /// Mark the current state as rendered
+    pub(crate) fn mark_rendered(&mut self) {
+        self.last_rendered_seqno = self.surface.current_seqno();
+    }
+
     pub(crate) fn screen_lines(&self) -> Vec<std::borrow::Cow<'_, Line>> {
         self.surface.screen_lines()
     }
 
-    pub(crate) fn resolve_cell_colors(&self, attrs: &CellAttributes) -> (egui::Color32, egui::Color32) {
+    pub(crate) fn resolve_cell_colors(
+        &self,
+        attrs: &CellAttributes,
+    ) -> (egui::Color32, egui::Color32) {
         (
             self.resolve_color(attrs.foreground(), true),
             self.resolve_color(attrs.background(), false),
@@ -240,7 +255,10 @@ impl TerminalGrid {
 
     fn handle_esc_action(&mut self, esc: Esc) {
         match esc {
-            Esc::Unspecified { intermediate, control } => {
+            Esc::Unspecified {
+                intermediate,
+                control,
+            } => {
                 if let Some(value) = intermediate {
                     self.esc_dispatch(&[value], control);
                 } else {
@@ -331,7 +349,11 @@ impl TerminalGrid {
     }
 
     fn current_charset(&self) -> Charset {
-        if self.use_g1 { self.g1 } else { self.g0 }
+        if self.use_g1 {
+            self.g1
+        } else {
+            self.g0
+        }
     }
 
     fn select_charset(&mut self, slot: u8, designator: u8) {
@@ -496,7 +518,8 @@ impl TerminalGrid {
         self.default_fg = DEFAULT_FG;
         self.default_bg = DEFAULT_BG;
         self.cursor_color = None;
-        self.surface.add_change(Change::ClearScreen(ColorAttribute::Default));
+        self.surface
+            .add_change(Change::ClearScreen(ColorAttribute::Default));
     }
 
     fn restore_saved_cursor(&mut self) {
@@ -592,14 +615,16 @@ impl TerminalGrid {
             b'K' => {
                 let mode = Self::param(params, 0, 0);
                 if mode == 0 {
-                    self.surface.add_change(Change::ClearToEndOfLine(ColorAttribute::Default));
+                    self.surface
+                        .add_change(Change::ClearToEndOfLine(ColorAttribute::Default));
                 } else {
                     let (col, row) = self.surface.cursor_position();
                     self.surface.add_change(Change::CursorPosition {
                         x: Position::Absolute(0),
                         y: Position::Absolute(row),
                     });
-                    self.surface.add_change(Change::ClearToEndOfLine(ColorAttribute::Default));
+                    self.surface
+                        .add_change(Change::ClearToEndOfLine(ColorAttribute::Default));
                     self.surface.add_change(Change::CursorPosition {
                         x: Position::Absolute(col),
                         y: Position::Absolute(row),
@@ -640,7 +665,8 @@ impl TerminalGrid {
                                     } else {
                                         CursorVisibility::Hidden
                                     };
-                                    self.surface.add_change(Change::CursorVisibility(visibility));
+                                    self.surface
+                                        .add_change(Change::CursorVisibility(visibility));
                                 }
                                 47 | 1047 => {
                                     if set {
@@ -707,7 +733,8 @@ impl TerminalGrid {
                     self.cur_fg_base = Some(idx);
                     self.apply_effective_bold_color();
                 } else {
-                    self.cur_attrs.set_background(ColorAttribute::PaletteIndex(idx));
+                    self.cur_attrs
+                        .set_background(ColorAttribute::PaletteIndex(idx));
                 }
             }
             ColorSpec::TrueColor(color) => {
@@ -754,7 +781,8 @@ impl TerminalGrid {
         self.ensure_alt_buffer();
         self.swap_screens();
         if clear {
-            self.surface.add_change(Change::ClearScreen(ColorAttribute::Default));
+            self.surface
+                .add_change(Change::ClearScreen(ColorAttribute::Default));
         }
     }
 
@@ -870,7 +898,11 @@ impl TerminalGrid {
         let Some(base) = self.cur_fg_base else {
             return;
         };
-        let effective = if self.bold && base < 8 { base + 8 } else { base };
+        let effective = if self.bold && base < 8 {
+            base + 8
+        } else {
+            base
+        };
         self.cur_attrs
             .set_foreground(ColorAttribute::PaletteIndex(effective));
     }

@@ -72,6 +72,9 @@ fn set_winsize_raw(fd: i32, cols: u16, rows: u16) {
 
 impl eframe::App for TerminalUI {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Track if we need to request a repaint
+        let mut needs_repaint = false;
+
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(self.grid.default_bg()))
             .show(ctx, |ui| {
@@ -81,6 +84,8 @@ impl eframe::App for TerminalUI {
                 let rows = (available.y / cell_h).floor() as usize;
                 let cols = cols.max(1);
                 let rows = rows.max(1);
+
+                // Check for resize
                 if self.grid.resize(cols, rows) {
                     set_winsize_raw(self.master_fd.as_raw_fd(), cols as u16, rows as u16);
                     let pgid = unsafe { tcgetpgrp(self.slave_fd.as_raw_fd()) };
@@ -88,11 +93,19 @@ impl eframe::App for TerminalUI {
                     unsafe {
                         let _ = killpg(target_pgid, SIGWINCH);
                     }
-                    ctx.request_repaint();
+                    needs_repaint = true;
                 }
 
+                // Process incoming data from PTY
+                let mut received_data = false;
                 while let Ok(bytes) = self.rx.try_recv() {
                     self.grid.write_bytes(&bytes);
+                    received_data = true;
+                }
+
+                // Check if terminal content has changed
+                if received_data && self.grid.has_changes() {
+                    needs_repaint = true;
                 }
 
                 let (rect, response) = ui.allocate_at_least(available, egui::Sense::click());
@@ -123,10 +136,8 @@ impl eframe::App for TerminalUI {
                         let width = cell.width().max(1) as f32;
                         let (fg, bg) = self.grid.resolve_cell_colors(cell.attrs());
                         let pos = grid_to_screen(origin, cell_w, cell_h, row, col);
-                        let rect = egui::Rect::from_min_size(
-                            pos,
-                            egui::vec2(cell_w * width, cell_h),
-                        );
+                        let rect =
+                            egui::Rect::from_min_size(pos, egui::vec2(cell_w * width, cell_h));
                         painter.rect_filled(rect, 0.0, bg);
                         painter.text(
                             pos,
@@ -175,15 +186,19 @@ impl eframe::App for TerminalUI {
                     painter.text(
                         cursor_pos,
                         egui::Align2::LEFT_TOP,
-                        cursor_cell
-                            .as_ref()
-                            .map(|cell| cell.str())
-                            .unwrap_or(" "),
+                        cursor_cell.as_ref().map(|cell| cell.str()).unwrap_or(" "),
                         self.font_id.clone(),
                         cursor_fg,
                     );
                 }
+
+                // Mark this render as complete
+                self.grid.mark_rendered();
             });
-        ctx.request_repaint();
+
+        // Only request repaint when there are actual changes
+        if needs_repaint {
+            ctx.request_repaint();
+        }
     }
 }
