@@ -531,6 +531,7 @@ impl TerminalGrid {
     }
 
     fn execute_csi(&mut self, final_byte: u8, params: &Params, private: bool) {
+        let current_bg = self.cur_attrs.background();
         match final_byte {
             b'A' => {
                 let n = Self::csi_count(params, 0);
@@ -599,16 +600,16 @@ impl TerminalGrid {
             b'J' => match Self::param(params, 0, 0) {
                 2 | 3 => {
                     self.surface
-                        .add_change(Change::ClearScreen(ColorAttribute::Default));
+                        .add_change(Change::ClearScreen(current_bg));
                 }
                 0 => {
                     self.surface
-                        .add_change(Change::ClearToEndOfScreen(ColorAttribute::Default));
+                        .add_change(Change::ClearToEndOfScreen(current_bg));
                 }
                 1 => {
                     // Minimal: clear full screen for "erase to start".
                     self.surface
-                        .add_change(Change::ClearScreen(ColorAttribute::Default));
+                        .add_change(Change::ClearScreen(current_bg));
                 }
                 _ => {}
             },
@@ -616,7 +617,7 @@ impl TerminalGrid {
                 let mode = Self::param(params, 0, 0);
                 if mode == 0 {
                     self.surface
-                        .add_change(Change::ClearToEndOfLine(ColorAttribute::Default));
+                        .add_change(Change::ClearToEndOfLine(current_bg));
                 } else {
                     let (col, row) = self.surface.cursor_position();
                     self.surface.add_change(Change::CursorPosition {
@@ -624,7 +625,7 @@ impl TerminalGrid {
                         y: Position::Absolute(row),
                     });
                     self.surface
-                        .add_change(Change::ClearToEndOfLine(ColorAttribute::Default));
+                        .add_change(Change::ClearToEndOfLine(current_bg));
                     self.surface.add_change(Change::CursorPosition {
                         x: Position::Absolute(col),
                         y: Position::Absolute(row),
