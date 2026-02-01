@@ -1,6 +1,8 @@
 use eframe::egui;
-use termwiz::cell::{CellAttributes, Underline};
-use termwiz::color::{ColorAttribute, SrgbaTuple};
+use termwiz::cell::{CellAttributes, Intensity, Underline};
+use termwiz::color::{ColorAttribute, ColorSpec, SrgbaTuple};
+use termwiz::escape::csi::{CSI, Sgr};
+use termwiz::escape::osc::{ColorOrQuery, DynamicColorNumber};
 use termwiz::escape::{Action, ControlCode, Esc, EscCode, OperatingSystemCommand};
 use termwiz::escape::parser::Parser;
 use termwiz::surface::{Change, CursorVisibility, Line, Position, Surface};
@@ -191,11 +193,16 @@ impl TerminalGrid {
             Action::Print(ch) => self.print_char(ch),
             Action::PrintString(text) => self.print_string(&text),
             Action::Control(code) => self.handle_control_code(code),
-            Action::CSI(csi) => {
-                if let Some((final_byte, params, private)) = Self::parse_csi_string(&csi.to_string()) {
-                    self.execute_csi(final_byte, &params, private);
+            Action::CSI(csi) => match csi {
+                CSI::Sgr(sgr) => self.apply_sgr(sgr),
+                _ => {
+                    if let Some((final_byte, params, private)) =
+                        Self::parse_csi_string(&csi.to_string())
+                    {
+                        self.execute_csi(final_byte, &params, private);
+                    }
                 }
-            }
+            },
             Action::Esc(esc) => self.handle_esc_action(esc),
             Action::OperatingSystemCommand(cmd) => self.handle_osc_action(*cmd),
             Action::DeviceControl(_)
@@ -267,18 +274,39 @@ impl TerminalGrid {
     }
 
     fn handle_osc_action(&mut self, cmd: OperatingSystemCommand) {
-        let params = match cmd {
-            OperatingSystemCommand::Unspecified(params) => params,
-            other => {
-                if let Some(params) = Self::parse_osc_string(&other.to_string()) {
-                    params
-                } else {
-                    return;
+        match cmd {
+            OperatingSystemCommand::ChangeColorNumber(pairs) => {
+                for pair in pairs {
+                    let ColorOrQuery::Color(color) = pair.color else {
+                        continue;
+                    };
+                    self.palette[pair.palette_index as usize] = Some(self.srgba_to_color(color));
                 }
             }
-        };
-
-        self.osc_dispatch(&params);
+            OperatingSystemCommand::ChangeDynamicColors(number, colors) => {
+                for color in colors {
+                    let ColorOrQuery::Color(color) = color else {
+                        continue;
+                    };
+                    self.apply_dynamic_color(number, color);
+                }
+            }
+            OperatingSystemCommand::ResetDynamicColor(number) => {
+                self.reset_dynamic_color(number);
+            }
+            OperatingSystemCommand::ResetColors(indices) => {
+                if indices.is_empty() {
+                    self.palette = [None; 256];
+                } else {
+                    for idx in indices {
+                        if (idx as usize) < self.palette.len() {
+                            self.palette[idx as usize] = None;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], byte: u8) {
@@ -600,9 +628,6 @@ impl TerminalGrid {
             }
             b'u' => self.restore_saved_cursor(),
             b'r' => self.set_scroll_region(params),
-            b'm' => {
-                self.apply_sgr_colors(params);
-            }
             b'h' | b'l' => {
                 if private {
                     let set = final_byte == b'h';
@@ -641,103 +666,61 @@ impl TerminalGrid {
         }
     }
 
-    fn apply_sgr_colors(&mut self, params: &Params) {
-        if params.is_empty() {
-            self.cur_attrs = CellAttributes::default();
-            self.cur_fg_base = None;
-            self.bold = false;
-            self.surface
-                .add_change(Change::AllAttributes(self.cur_attrs.clone()));
-            return;
-        }
-
-        let mut i = 0;
-        let params_vec: Vec<u16> = params.iter().filter_map(|p| p.first().copied()).collect();
-        while i < params_vec.len() {
-            match params_vec[i] {
-                0 => {
-                    self.cur_attrs = CellAttributes::default();
-                    self.cur_fg_base = None;
-                    self.bold = false;
-                }
-                1 => {
-                    self.bold = true;
-                    self.apply_effective_bold_color();
-                }
-                22 => {
-                    self.bold = false;
-                    self.apply_effective_bold_color();
-                }
-                // Ignore italic/underline/reverse and other style changes.
-                3 | 4 | 7 | 23 | 24 | 27 => {}
-                30..=37 => {
-                    let idx = (params_vec[i] - 30) as u8;
-                    self.cur_fg_base = Some(idx);
-                    self.apply_effective_bold_color();
-                }
-                40..=47 => {
-                    let idx = (params_vec[i] - 40) as u8;
-                    self.cur_attrs.set_background(ColorAttribute::PaletteIndex(idx));
-                }
-                90..=97 => {
-                    let idx = (params_vec[i] - 90 + 8) as u8;
-                    self.cur_fg_base = Some(idx);
-                    self.apply_effective_bold_color();
-                }
-                100..=107 => {
-                    let idx = (params_vec[i] - 100 + 8) as u8;
-                    self.cur_attrs.set_background(ColorAttribute::PaletteIndex(idx));
-                }
-                39 => {
-                    self.cur_attrs.set_foreground(ColorAttribute::Default);
-                    self.cur_fg_base = None;
-                }
-                49 => {
-                    self.cur_attrs.set_background(ColorAttribute::Default);
-                }
-                38 | 48 => {
-                    let is_fg = params_vec[i] == 38;
-                    if i + 1 < params_vec.len() {
-                        match params_vec[i + 1] {
-                            5 if i + 2 < params_vec.len() => {
-                                let idx = params_vec[i + 2] as u8;
-                                if is_fg {
-                                    self.cur_fg_base = Some(idx);
-                                    self.apply_effective_bold_color();
-                                } else {
-                                    self.cur_attrs
-                                        .set_background(ColorAttribute::PaletteIndex(idx));
-                                }
-                                i += 2;
-                            }
-                            2 if i + 4 < params_vec.len() => {
-                                let r = params_vec[i + 2] as f32 / 255.0;
-                                let g = params_vec[i + 3] as f32 / 255.0;
-                                let b = params_vec[i + 4] as f32 / 255.0;
-                                let color = SrgbaTuple(r, g, b, 1.0);
-                                if is_fg {
-                                    self.cur_fg_base = None;
-                                    self.cur_attrs.set_foreground(
-                                        ColorAttribute::TrueColorWithDefaultFallback(color),
-                                    );
-                                } else {
-                                    self.cur_attrs.set_background(
-                                        ColorAttribute::TrueColorWithDefaultFallback(color),
-                                    );
-                                }
-                                i += 4;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                _ => {}
+    fn apply_sgr(&mut self, sgr: Sgr) {
+        match sgr {
+            Sgr::Reset => {
+                self.cur_attrs = CellAttributes::default();
+                self.cur_fg_base = None;
+                self.bold = false;
             }
-            i += 1;
+            Sgr::Intensity(Intensity::Bold) => {
+                self.bold = true;
+                self.apply_effective_bold_color();
+            }
+            Sgr::Intensity(Intensity::Normal | Intensity::Half) => {
+                self.bold = false;
+                self.apply_effective_bold_color();
+            }
+            // Ignore italic/underline/reverse and other style changes for now.
+            Sgr::Italic(_) | Sgr::Underline(_) | Sgr::Inverse(_) => {}
+            Sgr::Foreground(spec) => self.apply_color_spec(spec, true),
+            Sgr::Background(spec) => self.apply_color_spec(spec, false),
+            _ => {}
         }
 
         self.surface
             .add_change(Change::AllAttributes(self.cur_attrs.clone()));
+    }
+
+    fn apply_color_spec(&mut self, spec: ColorSpec, is_fg: bool) {
+        match spec {
+            ColorSpec::Default => {
+                if is_fg {
+                    self.cur_attrs.set_foreground(ColorAttribute::Default);
+                    self.cur_fg_base = None;
+                } else {
+                    self.cur_attrs.set_background(ColorAttribute::Default);
+                }
+            }
+            ColorSpec::PaletteIndex(idx) => {
+                if is_fg {
+                    self.cur_fg_base = Some(idx);
+                    self.apply_effective_bold_color();
+                } else {
+                    self.cur_attrs.set_background(ColorAttribute::PaletteIndex(idx));
+                }
+            }
+            ColorSpec::TrueColor(color) => {
+                if is_fg {
+                    self.cur_fg_base = None;
+                    self.cur_attrs
+                        .set_foreground(ColorAttribute::TrueColorWithDefaultFallback(color));
+                } else {
+                    self.cur_attrs
+                        .set_background(ColorAttribute::TrueColorWithDefaultFallback(color));
+                }
+            }
+        }
     }
 
     fn ensure_alt_buffer(&mut self) {
@@ -892,154 +875,22 @@ impl TerminalGrid {
             .set_foreground(ColorAttribute::PaletteIndex(effective));
     }
 
-    fn osc_dispatch(&mut self, params: &[Vec<u8>]) {
-        if params.is_empty() {
-            return;
-        }
-        let Ok(cmd) = std::str::from_utf8(&params[0]) else {
-            return;
-        };
-        let Ok(cmd_num) = cmd.parse::<u16>() else {
-            return;
-        };
-
-        match cmd_num {
-            4 => {
-                if params.len() < 2 {
-                    return;
-                }
-                let mut i = 1;
-                while i + 1 < params.len() {
-                    let Ok(idx_str) = std::str::from_utf8(&params[i]) else {
-                        i += 2;
-                        continue;
-                    };
-                    let Ok(idx) = idx_str.parse::<usize>() else {
-                        i += 2;
-                        continue;
-                    };
-                    if idx >= 256 {
-                        i += 2;
-                        continue;
-                    }
-                    let Ok(spec) = std::str::from_utf8(&params[i + 1]) else {
-                        i += 2;
-                        continue;
-                    };
-                    if spec == "?" {
-                        i += 2;
-                        continue;
-                    }
-                    if let Some(color) = Self::parse_osc_color(spec) {
-                        self.palette[idx] = Some(color);
-                    }
-                    i += 2;
-                }
-            }
-            10..=12 => {
-                if params.len() < 2 {
-                    return;
-                }
-                let Ok(spec) = std::str::from_utf8(&params[1]) else {
-                    return;
-                };
-                if spec == "?" {
-                    return;
-                }
-                if let Some(color) = Self::parse_osc_color(spec) {
-                    match cmd_num {
-                        10 => self.default_fg = color,
-                        11 => self.default_bg = color,
-                        12 => self.cursor_color = Some(color),
-                        _ => {}
-                    }
-                }
-            }
-            104 => {
-                if params.len() < 2 {
-                    self.palette = [None; 256];
-                } else {
-                    for item in &params[1..] {
-                        let Ok(idx_str) = std::str::from_utf8(item) else {
-                            continue;
-                        };
-                        let Ok(idx) = idx_str.parse::<usize>() else {
-                            continue;
-                        };
-                        if idx < 256 {
-                            self.palette[idx] = None;
-                        }
-                    }
-                }
-            }
-            110 => self.default_fg = DEFAULT_FG,
-            111 => self.default_bg = DEFAULT_BG,
-            112 => self.cursor_color = None,
+    fn apply_dynamic_color(&mut self, number: DynamicColorNumber, color: SrgbaTuple) {
+        let color = self.srgba_to_color(color);
+        match number {
+            DynamicColorNumber::TextForegroundColor => self.default_fg = color,
+            DynamicColorNumber::TextBackgroundColor => self.default_bg = color,
+            DynamicColorNumber::TextCursorColor => self.cursor_color = Some(color),
             _ => {}
         }
     }
 
-    fn parse_osc_color(spec: &str) -> Option<egui::Color32> {
-        let spec = spec.trim();
-        if spec.eq_ignore_ascii_case("none") {
-            return None;
+    fn reset_dynamic_color(&mut self, number: DynamicColorNumber) {
+        match number {
+            DynamicColorNumber::TextForegroundColor => self.default_fg = DEFAULT_FG,
+            DynamicColorNumber::TextBackgroundColor => self.default_bg = DEFAULT_BG,
+            DynamicColorNumber::TextCursorColor => self.cursor_color = None,
+            _ => {}
         }
-        if let Some(rest) = spec.strip_prefix("rgb:") {
-            let comps: Vec<&str> = rest.split('/').collect();
-            if comps.len() < 3 {
-                return None;
-            }
-            let r = Self::parse_hex_component(comps[0])?;
-            let g = Self::parse_hex_component(comps[1])?;
-            let b = Self::parse_hex_component(comps[2])?;
-            return Some(egui::Color32::from_rgb(r, g, b));
-        }
-        if let Some(hex) = spec.strip_prefix('#') {
-            if hex.len() % 3 != 0 {
-                return None;
-            }
-            let step = hex.len() / 3;
-            if step == 0 || step > 4 {
-                return None;
-            }
-            let r = Self::parse_hex_component(&hex[0..step])?;
-            let g = Self::parse_hex_component(&hex[step..step * 2])?;
-            let b = Self::parse_hex_component(&hex[step * 2..step * 3])?;
-            return Some(egui::Color32::from_rgb(r, g, b));
-        }
-        None
-    }
-
-    fn parse_hex_component(comp: &str) -> Option<u8> {
-        if comp.is_empty() || comp.len() > 4 {
-            return None;
-        }
-        let value = u32::from_str_radix(comp, 16).ok()?;
-        let max = (1u32 << (comp.len() * 4)) - 1;
-        let scaled = (value.saturating_mul(255) + max / 2) / max;
-        Some(scaled as u8)
-    }
-
-    fn parse_osc_string(s: &str) -> Option<Vec<Vec<u8>>> {
-        let mut text = s;
-        if let Some(rest) = text.strip_prefix("\u{1b}]") {
-            text = rest;
-        } else if let Some(rest) = text.strip_prefix("\u{9d}") {
-            text = rest;
-        } else {
-            return None;
-        }
-
-        if let Some(rest) = text.strip_suffix("\u{1b}\\") {
-            text = rest;
-        } else if let Some(rest) = text.strip_suffix('\u{7}') {
-            text = rest;
-        }
-
-        let params = text
-            .split(';')
-            .map(|part| part.as_bytes().to_vec())
-            .collect::<Vec<_>>();
-        Some(params)
     }
 }
