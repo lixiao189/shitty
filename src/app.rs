@@ -28,8 +28,8 @@ pub fn run() -> eframe::Result<()> {
         let (width, height) = img.dimensions();
         Some(Arc::new(IconData {
             rgba: rgba.into_raw(),
-            width: width as u32,
-            height: height as u32,
+            width,
+            height,
         }))
     } else {
         None

@@ -36,7 +36,7 @@ fn ctrl_key_byte(key: egui::Key) -> Option<u8> {
     let bytes = name.as_bytes();
     if bytes.len() == 1 {
         let b = bytes[0];
-        if (b'A'..=b'Z').contains(&b) {
+        if b.is_ascii_uppercase() {
             return Some(b - b'A' + 1);
         }
     }
