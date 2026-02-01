@@ -116,37 +116,46 @@ impl eframe::App for TerminalUI {
 
                 painter.rect_filled(rect, 0.0, self.grid.default_bg());
 
-                for row in 0..self.grid.rows() {
-                    for col in 0..self.grid.cols() {
-                        let cell = self.grid.cell_at(row, col);
-                        let (fg, bg) = self.grid.resolve_cell_colors(&cell);
+                let lines = self.grid.screen_lines();
+                for (row, line) in lines.iter().enumerate() {
+                    for cell in line.visible_cells() {
+                        let col = cell.cell_index();
+                        let width = cell.width().max(1) as f32;
+                        let (fg, bg) = self.grid.resolve_cell_colors(cell.attrs());
                         let pos = grid_to_screen(origin, cell_w, cell_h, row, col);
-                        let rect = egui::Rect::from_min_size(pos, egui::vec2(cell_w, cell_h));
+                        let rect = egui::Rect::from_min_size(
+                            pos,
+                            egui::vec2(cell_w * width, cell_h),
+                        );
                         painter.rect_filled(rect, 0.0, bg);
-                        if !cell.cont() {
-                            painter.text(
-                                pos,
-                                egui::Align2::LEFT_TOP,
-                                cell.ch(),
-                                self.font_id.clone(),
-                                fg,
+                        painter.text(
+                            pos,
+                            egui::Align2::LEFT_TOP,
+                            cell.str(),
+                            self.font_id.clone(),
+                            fg,
+                        );
+                        if self.grid.cell_underline(cell.attrs()) {
+                            let y = pos.y + cell_h - 1.0;
+                            let rect = egui::Rect::from_min_size(
+                                egui::pos2(pos.x, y),
+                                egui::vec2(cell_w * width, 1.0),
                             );
-                            if cell.underline() {
-                                let y = pos.y + cell_h - 1.0;
-                                let rect = egui::Rect::from_min_size(
-                                    egui::pos2(pos.x, y),
-                                    egui::vec2(cell_w, 1.0),
-                                );
-                                painter.rect_filled(rect, 0.0, fg);
-                            }
+                            painter.rect_filled(rect, 0.0, fg);
                         }
                     }
                 }
 
                 if self.grid.cursor_visible() {
                     let (cursor_row, cursor_col) = self.grid.cursor_pos();
-                    let cursor_cell = self.grid.cell_at(cursor_row, cursor_col);
-                    let (cell_fg, cell_bg) = self.grid.resolve_cell_colors(&cursor_cell);
+                    let cursor_cell = lines
+                        .get(cursor_row)
+                        .and_then(|line| line.get_cell(cursor_col))
+                        .map(|cell| cell.as_cell());
+                    let (cell_fg, cell_bg) = cursor_cell
+                        .as_ref()
+                        .map(|cell| self.grid.resolve_cell_colors(cell.attrs()))
+                        .unwrap_or((egui::Color32::WHITE, self.grid.default_bg()));
                     let cursor_pos = grid_to_screen(origin, cell_w, cell_h, cursor_row, cursor_col);
                     let cursor_rect =
                         egui::Rect::from_min_size(cursor_pos, egui::vec2(cell_w, cell_h));
@@ -166,7 +175,10 @@ impl eframe::App for TerminalUI {
                     painter.text(
                         cursor_pos,
                         egui::Align2::LEFT_TOP,
-                        cursor_cell.ch(),
+                        cursor_cell
+                            .as_ref()
+                            .map(|cell| cell.str())
+                            .unwrap_or(" "),
                         self.font_id.clone(),
                         cursor_fg,
                     );

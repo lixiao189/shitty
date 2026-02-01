@@ -1,12 +1,15 @@
 use eframe::egui;
-use unicode_width::UnicodeWidthChar;
-use vte::{Params, Perform};
+use termwiz::cell::{CellAttributes, Underline};
+use termwiz::color::{ColorAttribute, SrgbaTuple};
+use termwiz::escape::{Action, ControlCode, Esc, EscCode, OperatingSystemCommand};
+use termwiz::escape::parser::Parser;
+use termwiz::surface::{Change, CursorVisibility, Line, Position, Surface};
 
-use crate::terminal::color::{
-    ansi_16_color, parse_color_spec, xterm_256_color, ColorKind, DEFAULT_BG, DEFAULT_FG,
-};
+use crate::terminal::color::{xterm_256_color, DEFAULT_BG, DEFAULT_FG};
 
 const TAB_SIZE: usize = 8;
+
+type Params = Vec<Vec<u16>>;
 
 #[derive(Clone, Copy)]
 enum Charset {
@@ -37,73 +40,28 @@ fn map_dec_special(ch: char) -> char {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct Cell {
-    ch: char,
-    fg_kind: ColorKind,
-    bg_kind: ColorKind,
-    underline: bool,
-    cont: bool,
-}
-
-impl Cell {
-    pub(crate) fn ch(&self) -> char {
-        self.ch
-    }
-
-    pub(crate) fn underline(&self) -> bool {
-        self.underline
-    }
-
-    pub(crate) fn cont(&self) -> bool {
-        self.cont
-    }
-}
-
-impl Default for Cell {
-    fn default() -> Self {
-        Self {
-            ch: ' ',
-            fg_kind: ColorKind::Default,
-            bg_kind: ColorKind::Default,
-            underline: false,
-            cont: false,
-        }
-    }
-}
-
 pub(crate) struct TerminalGrid {
-    cols: usize,
-    rows: usize,
-    cells: Vec<Cell>,
-    cursor_row: usize,
-    cursor_col: usize,
-    saved_cursor: (usize, usize),
+    surface: Surface,
+    parser: Parser,
+    cur_attrs: CellAttributes,
+    cur_fg_base: Option<u8>,
+    bold: bool,
+    palette: [Option<egui::Color32>; 256],
+    default_fg: egui::Color32,
+    default_bg: egui::Color32,
+    cursor_color: Option<egui::Color32>,
     scroll_top: usize,
     scroll_bottom: usize,
-    alt_cells: Vec<Cell>,
-    alt_cursor_row: usize,
-    alt_cursor_col: usize,
+    saved_cursor: (usize, usize),
+    alt_surface: Option<Surface>,
     alt_saved_cursor: (usize, usize),
     alt_scroll_top: usize,
     alt_scroll_bottom: usize,
     in_alt: bool,
-    cursor_visible: bool,
     saved_cursor_1049: Option<(usize, usize)>,
-    parser: vte::Parser,
-    cur_fg_kind: ColorKind,
-    cur_bg_kind: ColorKind,
-    cur_bold: bool,
-    cur_underline: bool,
-    cur_inverse: bool,
     g0: Charset,
     g1: Charset,
     use_g1: bool,
-    last_printable: Option<char>,
-    default_fg: egui::Color32,
-    default_bg: egui::Color32,
-    cursor_color: Option<egui::Color32>,
-    palette: [Option<egui::Color32>; 256],
 }
 
 impl TerminalGrid {
@@ -111,46 +69,36 @@ impl TerminalGrid {
         let cols = cols.max(1);
         let rows = rows.max(1);
         Self {
-            cols,
-            rows,
-            cells: vec![Cell::default(); cols * rows],
-            cursor_row: 0,
-            cursor_col: 0,
-            saved_cursor: (0, 0),
+            surface: Surface::new(cols, rows),
+            parser: Parser::new(),
+            cur_attrs: CellAttributes::default(),
+            cur_fg_base: None,
+            bold: false,
+            palette: [None; 256],
+            default_fg: DEFAULT_FG,
+            default_bg: DEFAULT_BG,
+            cursor_color: None,
             scroll_top: 0,
             scroll_bottom: rows - 1,
-            alt_cells: Vec::new(),
-            alt_cursor_row: 0,
-            alt_cursor_col: 0,
+            saved_cursor: (0, 0),
+            alt_surface: None,
             alt_saved_cursor: (0, 0),
             alt_scroll_top: 0,
             alt_scroll_bottom: rows - 1,
             in_alt: false,
-            cursor_visible: true,
             saved_cursor_1049: None,
-            parser: vte::Parser::new(),
-            cur_fg_kind: ColorKind::Default,
-            cur_bg_kind: ColorKind::Default,
-            cur_bold: false,
-            cur_underline: false,
-            cur_inverse: false,
             g0: Charset::Ascii,
             g1: Charset::Ascii,
             use_g1: false,
-            last_printable: None,
-            default_fg: DEFAULT_FG,
-            default_bg: DEFAULT_BG,
-            cursor_color: None,
-            palette: [None; 256],
         }
     }
 
     pub(crate) fn rows(&self) -> usize {
-        self.rows
+        self.surface.dimensions().1
     }
 
     pub(crate) fn cols(&self) -> usize {
-        self.cols
+        self.surface.dimensions().0
     }
 
     pub(crate) fn default_bg(&self) -> egui::Color32 {
@@ -158,7 +106,7 @@ impl TerminalGrid {
     }
 
     pub(crate) fn cursor_visible(&self) -> bool {
-        self.cursor_visible
+        self.surface.cursor_visibility() == CursorVisibility::Visible
     }
 
     pub(crate) fn cursor_color(&self) -> Option<egui::Color32> {
@@ -166,110 +114,191 @@ impl TerminalGrid {
     }
 
     pub(crate) fn cursor_pos(&self) -> (usize, usize) {
-        (self.cursor_row, self.cursor_col)
+        let (col, row) = self.surface.cursor_position();
+        (row, col)
     }
 
     pub(crate) fn resize(&mut self, cols: usize, rows: usize) -> bool {
         let cols = cols.max(1);
         let rows = rows.max(1);
-        if cols == self.cols && rows == self.rows {
+        if (cols, rows) == self.surface.dimensions() {
             return false;
         }
-        self.cols = cols;
-        self.rows = rows;
-        self.cells = vec![Cell::default(); cols * rows];
-        self.cursor_row = self.cursor_row.min(rows - 1);
-        self.cursor_col = self.cursor_col.min(cols - 1);
+        self.surface.resize(cols, rows);
         self.scroll_top = 0;
         self.scroll_bottom = rows - 1;
-        if !self.alt_cells.is_empty() {
-            self.alt_cells = vec![Cell::default(); cols * rows];
+        if let Some(alt) = &mut self.alt_surface {
+            alt.resize(cols, rows);
+            self.alt_scroll_top = 0;
+            self.alt_scroll_bottom = rows - 1;
         }
-        self.alt_cursor_row = self.alt_cursor_row.min(rows - 1);
-        self.alt_cursor_col = self.alt_cursor_col.min(cols - 1);
-        self.alt_scroll_top = 0;
-        self.alt_scroll_bottom = rows - 1;
         true
     }
 
     pub(crate) fn write_bytes(&mut self, bytes: &[u8]) {
-        let mut parser = std::mem::replace(&mut self.parser, vte::Parser::new());
-        for &byte in bytes {
-            parser.advance(self, byte);
-        }
+        let mut parser = std::mem::replace(&mut self.parser, Parser::new());
+        parser.parse(bytes, |action| self.handle_action(action));
         self.parser = parser;
     }
 
-    pub(crate) fn cell_at(&self, row: usize, col: usize) -> Cell {
-        if row < self.rows && col < self.cols {
-            self.cells[self.cell_index(row, col)]
-        } else {
-            Cell::default()
-        }
+    pub(crate) fn screen_lines(&self) -> Vec<std::borrow::Cow<'_, Line>> {
+        self.surface.screen_lines()
     }
 
-    pub(crate) fn resolve_cell_colors(&self, cell: &Cell) -> (egui::Color32, egui::Color32) {
+    pub(crate) fn resolve_cell_colors(&self, attrs: &CellAttributes) -> (egui::Color32, egui::Color32) {
         (
-            self.resolve_color(cell.fg_kind, true),
-            self.resolve_color(cell.bg_kind, false),
+            self.resolve_color(attrs.foreground(), true),
+            self.resolve_color(attrs.background(), false),
         )
     }
 
-    fn clear(&mut self) {
-        let (fg_kind, bg_kind, underline) = self.current_cell_attrs();
-        for cell in &mut self.cells {
-            cell.ch = ' ';
-            cell.fg_kind = fg_kind;
-            cell.bg_kind = bg_kind;
-            cell.underline = underline;
-            cell.cont = false;
-        }
-        self.cursor_row = 0;
-        self.cursor_col = 0;
+    pub(crate) fn cell_underline(&self, attrs: &CellAttributes) -> bool {
+        attrs.underline() != Underline::None
     }
 
-    fn cell_index(&self, row: usize, col: usize) -> usize {
-        row * self.cols + col
-    }
-
-    fn set_cell(
-        &mut self,
-        row: usize,
-        col: usize,
-        ch: char,
-        fg_kind: ColorKind,
-        bg_kind: ColorKind,
-        underline: bool,
-        cont: bool,
-    ) {
-        if row < self.rows && col < self.cols {
-            let idx = self.cell_index(row, col);
-            self.cells[idx].ch = ch;
-            self.cells[idx].fg_kind = fg_kind;
-            self.cells[idx].bg_kind = bg_kind;
-            self.cells[idx].underline = underline;
-            self.cells[idx].cont = cont;
-        }
-    }
-
-    fn set_blank_cell(&mut self, row: usize, col: usize) {
-        let (fg_kind, bg_kind, underline) = self.current_cell_attrs();
-        self.set_cell(row, col, ' ', fg_kind, bg_kind, underline, false);
-    }
-
-    fn clear_wide_at(&mut self, row: usize, col: usize) {
-        if row >= self.rows || col >= self.cols {
-            return;
-        }
-        let idx = self.cell_index(row, col);
-        if self.cells[idx].cont {
-            if col > 0 {
-                self.set_blank_cell(row, col - 1);
+    fn resolve_color(&self, attr: ColorAttribute, is_fg: bool) -> egui::Color32 {
+        match attr {
+            ColorAttribute::Default => {
+                if is_fg {
+                    self.default_fg
+                } else {
+                    self.default_bg
+                }
             }
-            self.cells[idx].cont = false;
+            ColorAttribute::PaletteIndex(idx) => {
+                if let Some(color) = self.palette[idx as usize] {
+                    color
+                } else {
+                    xterm_256_color(idx)
+                }
+            }
+            ColorAttribute::TrueColorWithPaletteFallback(color, _) => self.srgba_to_color(color),
+            ColorAttribute::TrueColorWithDefaultFallback(color) => self.srgba_to_color(color),
         }
-        if col + 1 < self.cols && self.cells[idx + 1].cont {
-            self.set_blank_cell(row, col + 1);
+    }
+
+    fn srgba_to_color(&self, color: SrgbaTuple) -> egui::Color32 {
+        let SrgbaTuple(r, g, b, _) = color;
+        egui::Color32::from_rgb(
+            (r.clamp(0.0, 1.0) * 255.0) as u8,
+            (g.clamp(0.0, 1.0) * 255.0) as u8,
+            (b.clamp(0.0, 1.0) * 255.0) as u8,
+        )
+    }
+
+    fn handle_action(&mut self, action: Action) {
+        match action {
+            Action::Print(ch) => self.print_char(ch),
+            Action::PrintString(text) => self.print_string(&text),
+            Action::Control(code) => self.handle_control_code(code),
+            Action::CSI(csi) => {
+                if let Some((final_byte, params, private)) = Self::parse_csi_string(&csi.to_string()) {
+                    self.execute_csi(final_byte, &params, private);
+                }
+            }
+            Action::Esc(esc) => self.handle_esc_action(esc),
+            Action::OperatingSystemCommand(cmd) => self.handle_osc_action(*cmd),
+            Action::DeviceControl(_)
+            | Action::Sixel(_)
+            | Action::KittyImage(_)
+            | Action::XtGetTcap(_) => {}
+        }
+    }
+
+    fn print_char(&mut self, ch: char) {
+        let mapped = self.map_charset_char(ch);
+        self.surface.add_change(Change::Text(mapped.to_string()));
+    }
+
+    fn print_string(&mut self, text: &str) {
+        let mut mapped = String::with_capacity(text.len());
+        for ch in text.chars() {
+            mapped.push(self.map_charset_char(ch));
+        }
+        self.surface.add_change(Change::Text(mapped));
+    }
+
+    fn handle_control_code(&mut self, code: ControlCode) {
+        let byte = code as u8;
+        match byte {
+            0x08 => self.backspace(),
+            0x09 => self.tab(),
+            0x0a | 0x0b | 0x0c => self.newline(),
+            0x0d => self.carriage_return(),
+            0x0e => self.use_g1 = true,
+            0x0f => self.use_g1 = false,
+            _ => {}
+        }
+    }
+
+    fn handle_esc_action(&mut self, esc: Esc) {
+        match esc {
+            Esc::Unspecified { intermediate, control } => {
+                if let Some(value) = intermediate {
+                    self.esc_dispatch(&[value], control);
+                } else {
+                    self.esc_dispatch(&[], control);
+                }
+            }
+            Esc::Code(code) => match code {
+                EscCode::Index => self.newline(),
+                EscCode::ReverseIndex => self.reverse_index(),
+                EscCode::NextLine => {
+                    self.newline();
+                    self.carriage_return();
+                }
+                EscCode::FullReset => self.reset(),
+                EscCode::DecSaveCursorPosition => {
+                    let (col, row) = self.surface.cursor_position();
+                    self.saved_cursor = (row, col);
+                }
+                EscCode::DecRestoreCursorPosition => self.restore_saved_cursor(),
+                EscCode::DecLineDrawingG0 => self.select_charset(b'(', b'0'),
+                EscCode::AsciiCharacterSetG0 | EscCode::UkCharacterSetG0 => {
+                    self.select_charset(b'(', b'B')
+                }
+                EscCode::DecLineDrawingG1 => self.select_charset(b')', b'0'),
+                EscCode::AsciiCharacterSetG1 | EscCode::UkCharacterSetG1 => {
+                    self.select_charset(b')', b'B')
+                }
+                _ => {}
+            },
+        }
+    }
+
+    fn handle_osc_action(&mut self, cmd: OperatingSystemCommand) {
+        let params = match cmd {
+            OperatingSystemCommand::Unspecified(params) => params,
+            other => {
+                if let Some(params) = Self::parse_osc_string(&other.to_string()) {
+                    params
+                } else {
+                    return;
+                }
+            }
+        };
+
+        self.osc_dispatch(&params);
+    }
+
+    fn esc_dispatch(&mut self, intermediates: &[u8], byte: u8) {
+        match (intermediates, byte) {
+            ([], b'D') => self.newline(),
+            ([], b'M') => self.reverse_index(),
+            ([], b'E') => {
+                self.newline();
+                self.carriage_return();
+            }
+            ([], b'c') => self.reset(),
+            ([], b'7') => {
+                let (col, row) = self.surface.cursor_position();
+                self.saved_cursor = (row, col);
+            }
+            ([], b'8') => self.restore_saved_cursor(),
+            ([i], designator) if *i == b'(' || *i == b')' => {
+                self.select_charset(*i, designator);
+            }
+            _ => {}
         }
     }
 
@@ -298,346 +327,257 @@ impl TerminalGrid {
     }
 
     fn newline(&mut self) {
-        if self.cursor_row >= self.scroll_bottom {
-            self.scroll_up(1);
+        self.surface.add_change(Change::Text("\n".to_string()));
+    }
+
+    fn reverse_index(&mut self) {
+        let (_, row) = self.surface.cursor_position();
+        if row <= self.scroll_top {
+            self.scroll_down(1);
         } else {
-            self.cursor_row += 1;
+            self.surface.add_change(Change::CursorPosition {
+                x: Position::Relative(0),
+                y: Position::Relative(-1),
+            });
         }
     }
 
     fn scroll_up(&mut self, lines: usize) {
-        let top = self.scroll_top.min(self.rows - 1);
-        let bottom = self.scroll_bottom.min(self.rows - 1);
+        let top = self.scroll_top.min(self.rows().saturating_sub(1));
+        let bottom = self.scroll_bottom.min(self.rows().saturating_sub(1));
         if top >= bottom {
             return;
         }
-        for _ in 0..lines {
-            for row in (top + 1)..=bottom {
-                let src = row * self.cols;
-                let dst = (row - 1) * self.cols;
-                let (left, right) = self.cells.split_at_mut(src);
-                left[dst..dst + self.cols].copy_from_slice(&right[..self.cols]);
-            }
-            let start = bottom * self.cols;
-            let (fg_kind, bg_kind, underline) = self.current_cell_attrs();
-            for cell in &mut self.cells[start..start + self.cols] {
-                cell.ch = ' ';
-                cell.fg_kind = fg_kind;
-                cell.bg_kind = bg_kind;
-                cell.underline = underline;
-                cell.cont = false;
-            }
-        }
+        let region_size = bottom - top + 1;
+        let count = lines.min(region_size);
+        self.surface.add_change(Change::ScrollRegionUp {
+            first_row: top,
+            region_size,
+            scroll_count: count,
+        });
     }
 
     fn scroll_down(&mut self, lines: usize) {
-        let top = self.scroll_top.min(self.rows - 1);
-        let bottom = self.scroll_bottom.min(self.rows - 1);
+        let top = self.scroll_top.min(self.rows().saturating_sub(1));
+        let bottom = self.scroll_bottom.min(self.rows().saturating_sub(1));
         if top >= bottom {
             return;
         }
-        for _ in 0..lines {
-            for row in (top..bottom).rev() {
-                let src = row * self.cols;
-                let dst = (row + 1) * self.cols;
-                self.cells.copy_within(src..src + self.cols, dst);
-            }
-            let start = top * self.cols;
-            let (fg_kind, bg_kind, underline) = self.current_cell_attrs();
-            for cell in &mut self.cells[start..start + self.cols] {
-                cell.ch = ' ';
-                cell.fg_kind = fg_kind;
-                cell.bg_kind = bg_kind;
-                cell.underline = underline;
-                cell.cont = false;
-            }
-        }
+        let region_size = bottom - top + 1;
+        let count = lines.min(region_size);
+        self.surface.add_change(Change::ScrollRegionDown {
+            first_row: top,
+            region_size,
+            scroll_count: count,
+        });
     }
 
     fn carriage_return(&mut self) {
-        self.cursor_col = 0;
-    }
-
-    fn next_line(&mut self, n: usize) {
-        let n = n.max(1);
-        self.cursor_row = (self.cursor_row + n).min(self.rows - 1);
-        self.cursor_col = 0;
-    }
-
-    fn prev_line(&mut self, n: usize) {
-        let n = n.max(1);
-        self.cursor_row = self.cursor_row.saturating_sub(n);
-        self.cursor_col = 0;
+        self.surface.add_change(Change::CursorPosition {
+            x: Position::Absolute(0),
+            y: Position::Relative(0),
+        });
     }
 
     fn backspace(&mut self) {
-        if self.cursor_col > 0 {
-            self.cursor_col -= 1;
-        }
+        self.surface.add_change(Change::CursorPosition {
+            x: Position::Relative(-1),
+            y: Position::Relative(0),
+        });
     }
 
     fn tab(&mut self) {
-        let next = ((self.cursor_col / TAB_SIZE) + 1) * TAB_SIZE;
-        let (fg_kind, bg_kind, underline) = self.current_cell_attrs();
-        while self.cursor_col < self.cols && self.cursor_col < next {
-            self.set_cell(
-                self.cursor_row,
-                self.cursor_col,
-                ' ',
-                fg_kind,
-                bg_kind,
-                underline,
-                false,
-            );
-            self.cursor_col += 1;
-        }
-        if self.cursor_col >= self.cols {
-            self.cursor_col = 0;
-            self.newline();
-        }
-    }
-
-    fn put_char(&mut self, ch: char) {
-        if self.cursor_row >= self.rows || self.cursor_col >= self.cols {
-            return;
-        }
-        let (fg_kind, bg_kind, underline) = self.current_cell_attrs();
-        let width = UnicodeWidthChar::width(ch).unwrap_or(1);
-        if width == 0 {
-            return;
-        }
-        if width >= 2 {
-            if self.cursor_col + 1 >= self.cols {
-                self.cursor_col = 0;
-                self.newline();
-                if self.cursor_row >= self.rows {
-                    return;
-                }
-            }
-            self.clear_wide_at(self.cursor_row, self.cursor_col);
-            self.set_cell(
-                self.cursor_row,
-                self.cursor_col,
-                ch,
-                fg_kind,
-                bg_kind,
-                underline,
-                false,
-            );
-            if self.cursor_col + 1 < self.cols {
-                self.clear_wide_at(self.cursor_row, self.cursor_col + 1);
-                self.set_cell(
-                    self.cursor_row,
-                    self.cursor_col + 1,
-                    ' ',
-                    fg_kind,
-                    bg_kind,
-                    underline,
-                    true,
-                );
-            }
-            self.cursor_col += 2;
-            self.last_printable = Some(ch);
-        } else {
-            self.clear_wide_at(self.cursor_row, self.cursor_col);
-            self.set_cell(
-                self.cursor_row,
-                self.cursor_col,
-                ch,
-                fg_kind,
-                bg_kind,
-                underline,
-                false,
-            );
-            self.cursor_col += 1;
-            self.last_printable = Some(ch);
-        }
-        if self.cursor_col >= self.cols {
-            self.cursor_col = 0;
-            self.newline();
-        }
+        let (col, row) = self.surface.cursor_position();
+        let width = self.cols().max(1);
+        let next = ((col / TAB_SIZE) + 1) * TAB_SIZE;
+        let target = next.min(width.saturating_sub(1));
+        self.surface.add_change(Change::CursorPosition {
+            x: Position::Absolute(target),
+            y: Position::Absolute(row),
+        });
     }
 
     fn insert_lines(&mut self, n: usize) {
-        if self.cursor_row < self.scroll_top || self.cursor_row > self.scroll_bottom {
+        let (_, row) = self.surface.cursor_position();
+        if row < self.scroll_top || row > self.scroll_bottom {
             return;
         }
-        let n = n.min(self.scroll_bottom - self.cursor_row + 1);
-        let (fg_kind, bg_kind, underline) = self.current_cell_attrs();
-        for _ in 0..n {
-            for row in (self.cursor_row..self.scroll_bottom).rev() {
-                let src = row * self.cols;
-                let dst = (row + 1) * self.cols;
-                self.cells.copy_within(src..src + self.cols, dst);
-            }
-            let start = self.cursor_row * self.cols;
-            for cell in &mut self.cells[start..start + self.cols] {
-                cell.ch = ' ';
-                cell.fg_kind = fg_kind;
-                cell.bg_kind = bg_kind;
-                cell.underline = underline;
-                cell.cont = false;
-            }
-        }
+        let region_size = self.scroll_bottom - row + 1;
+        let count = n.min(region_size);
+        self.surface.add_change(Change::ScrollRegionDown {
+            first_row: row,
+            region_size,
+            scroll_count: count,
+        });
     }
 
     fn delete_lines(&mut self, n: usize) {
-        if self.cursor_row < self.scroll_top || self.cursor_row > self.scroll_bottom {
+        let (_, row) = self.surface.cursor_position();
+        if row < self.scroll_top || row > self.scroll_bottom {
             return;
         }
-        let n = n.min(self.scroll_bottom - self.cursor_row + 1);
-        let (fg_kind, bg_kind, underline) = self.current_cell_attrs();
-        for _ in 0..n {
-            for row in self.cursor_row..self.scroll_bottom {
-                let src = (row + 1) * self.cols;
-                let dst = row * self.cols;
-                self.cells.copy_within(src..src + self.cols, dst);
-            }
-            let start = self.scroll_bottom * self.cols;
-            for cell in &mut self.cells[start..start + self.cols] {
-                cell.ch = ' ';
-                cell.fg_kind = fg_kind;
-                cell.bg_kind = bg_kind;
-                cell.underline = underline;
-                cell.cont = false;
-            }
-        }
+        let region_size = self.scroll_bottom - row + 1;
+        let count = n.min(region_size);
+        self.surface.add_change(Change::ScrollRegionUp {
+            first_row: row,
+            region_size,
+            scroll_count: count,
+        });
     }
 
-    fn insert_chars(&mut self, n: usize) {
-        let row = self.cursor_row;
-        if row >= self.rows || self.cursor_col >= self.cols {
-            return;
+    fn set_scroll_region(&mut self, params: &Params) {
+        let mut top = Self::param(params, 0, 1) as usize;
+        let mut bottom = Self::param(params, 1, self.rows() as u16) as usize;
+        if top == 0 {
+            top = 1;
         }
-        let n = n.min(self.cols - self.cursor_col);
-        let line_start = row * self.cols;
-        let line_end = line_start + self.cols;
-        self.cells.copy_within(
-            line_start + self.cursor_col..line_end - n,
-            line_start + self.cursor_col + n,
-        );
-        let (fg_kind, bg_kind, underline) = self.current_cell_attrs();
-        for col in self.cursor_col..self.cursor_col + n {
-            self.set_cell(row, col, ' ', fg_kind, bg_kind, underline, false);
+        if bottom == 0 {
+            bottom = self.rows();
         }
+        let top = top.saturating_sub(1).min(self.rows().saturating_sub(1));
+        let bottom = bottom.saturating_sub(1).min(self.rows().saturating_sub(1));
+        if top < bottom {
+            self.scroll_top = top;
+            self.scroll_bottom = bottom;
+        } else {
+            self.scroll_top = 0;
+            self.scroll_bottom = self.rows().saturating_sub(1);
+        }
+        self.surface.add_change(Change::CursorPosition {
+            x: Position::Absolute(0),
+            y: Position::Absolute(self.scroll_top),
+        });
     }
 
-    fn delete_chars(&mut self, n: usize) {
-        let row = self.cursor_row;
-        if row >= self.rows || self.cursor_col >= self.cols {
-            return;
+    fn reset(&mut self) {
+        if self.in_alt {
+            self.exit_alternate(false);
         }
-        let n = n.min(self.cols - self.cursor_col);
-        let line_start = row * self.cols;
-        let line_end = line_start + self.cols;
-        self.cells.copy_within(
-            line_start + self.cursor_col + n..line_end,
-            line_start + self.cursor_col,
-        );
-        let (fg_kind, bg_kind, underline) = self.current_cell_attrs();
-        for col in (self.cols - n)..self.cols {
-            self.set_cell(row, col, ' ', fg_kind, bg_kind, underline, false);
-        }
+        self.saved_cursor = (0, 0);
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows().saturating_sub(1);
+        self.g0 = Charset::Ascii;
+        self.g1 = Charset::Ascii;
+        self.use_g1 = false;
+        self.cur_attrs = CellAttributes::default();
+        self.cur_fg_base = None;
+        self.bold = false;
+        self.surface
+            .add_change(Change::AllAttributes(self.cur_attrs.clone()));
+        self.palette = [None; 256];
+        self.default_fg = DEFAULT_FG;
+        self.default_bg = DEFAULT_BG;
+        self.cursor_color = None;
+        self.surface.add_change(Change::ClearScreen(ColorAttribute::Default));
     }
 
-    fn erase_chars(&mut self, n: usize) {
-        let row = self.cursor_row;
-        if row >= self.rows || self.cursor_col >= self.cols {
-            return;
-        }
-        let n = n.min(self.cols - self.cursor_col);
-        let (fg_kind, bg_kind, underline) = self.current_cell_attrs();
-        for col in self.cursor_col..self.cursor_col + n {
-            self.set_cell(row, col, ' ', fg_kind, bg_kind, underline, false);
-        }
-    }
-
-    fn repeat_last(&mut self, n: usize) {
-        if let Some(ch) = self.last_printable {
-            for _ in 0..n.max(1) {
-                self.put_char(ch);
-            }
-        }
-    }
-
-    fn param(params: &Params, idx: usize, default: u16) -> u16 {
-        params
-            .iter()
-            .nth(idx)
-            .and_then(|p| p.first().copied())
-            .unwrap_or(default)
-    }
-
-    fn csi_count(params: &Params, idx: usize) -> usize {
-        let mut n = Self::param(params, idx, 1);
-        if n == 0 {
-            n = 1;
-        }
-        n as usize
-    }
-
-    fn csi_position(params: &Params, idx: usize, max: usize) -> usize {
-        let mut v = Self::param(params, idx, 1);
-        if v == 0 {
-            v = 1;
-        }
-        (v as usize).saturating_sub(1).min(max)
+    fn restore_saved_cursor(&mut self) {
+        let (row, col) = self.saved_cursor;
+        self.surface.add_change(Change::CursorPosition {
+            x: Position::Absolute(col),
+            y: Position::Absolute(row),
+        });
     }
 
     fn execute_csi(&mut self, final_byte: u8, params: &Params, private: bool) {
         match final_byte {
             b'A' => {
                 let n = Self::csi_count(params, 0);
-                self.cursor_row = self.cursor_row.saturating_sub(n);
+                self.surface.add_change(Change::CursorPosition {
+                    x: Position::Relative(0),
+                    y: Position::Relative(-(n as isize)),
+                });
             }
             b'B' => {
                 let n = Self::csi_count(params, 0);
-                self.cursor_row = (self.cursor_row + n).min(self.rows - 1);
+                self.surface.add_change(Change::CursorPosition {
+                    x: Position::Relative(0),
+                    y: Position::Relative(n as isize),
+                });
             }
             b'C' => {
                 let n = Self::csi_count(params, 0);
-                self.cursor_col = (self.cursor_col + n).min(self.cols - 1);
+                self.surface.add_change(Change::CursorPosition {
+                    x: Position::Relative(n as isize),
+                    y: Position::Relative(0),
+                });
             }
             b'D' => {
                 let n = Self::csi_count(params, 0);
-                self.cursor_col = self.cursor_col.saturating_sub(n);
+                self.surface.add_change(Change::CursorPosition {
+                    x: Position::Relative(-(n as isize)),
+                    y: Position::Relative(0),
+                });
             }
             b'E' => {
                 let n = Self::csi_count(params, 0);
-                self.next_line(n);
+                self.surface.add_change(Change::CursorPosition {
+                    x: Position::Absolute(0),
+                    y: Position::Relative(n as isize),
+                });
             }
             b'F' => {
                 let n = Self::csi_count(params, 0);
-                self.prev_line(n);
+                self.surface.add_change(Change::CursorPosition {
+                    x: Position::Absolute(0),
+                    y: Position::Relative(-(n as isize)),
+                });
             }
             b'G' => {
-                let col = Self::csi_position(params, 0, self.cols - 1);
-                self.cursor_col = col;
+                let col = Self::csi_position(params, 0, self.cols().saturating_sub(1));
+                self.surface.add_change(Change::CursorPosition {
+                    x: Position::Absolute(col),
+                    y: Position::Relative(0),
+                });
             }
             b'd' => {
-                let row = Self::csi_position(params, 0, self.rows - 1);
-                self.cursor_row = row;
+                let row = Self::csi_position(params, 0, self.rows().saturating_sub(1));
+                self.surface.add_change(Change::CursorPosition {
+                    x: Position::Relative(0),
+                    y: Position::Absolute(row),
+                });
             }
             b'H' | b'f' => {
-                let row = Self::csi_position(params, 0, self.rows - 1);
-                let col = Self::csi_position(params, 1, self.cols - 1);
-                self.cursor_row = row;
-                self.cursor_col = col;
+                let row = Self::csi_position(params, 0, self.rows().saturating_sub(1));
+                let col = Self::csi_position(params, 1, self.cols().saturating_sub(1));
+                self.surface.add_change(Change::CursorPosition {
+                    x: Position::Absolute(col),
+                    y: Position::Absolute(row),
+                });
             }
-            b'@' => {
-                let n = Self::csi_count(params, 0);
-                self.insert_chars(n);
+            b'J' => match Self::param(params, 0, 0) {
+                2 | 3 => {
+                    self.surface
+                        .add_change(Change::ClearScreen(ColorAttribute::Default));
+                }
+                0 => {
+                    self.surface
+                        .add_change(Change::ClearToEndOfScreen(ColorAttribute::Default));
+                }
+                1 => {
+                    // Minimal: clear full screen for "erase to start".
+                    self.surface
+                        .add_change(Change::ClearScreen(ColorAttribute::Default));
+                }
+                _ => {}
+            },
+            b'K' => {
+                let mode = Self::param(params, 0, 0);
+                if mode == 0 {
+                    self.surface.add_change(Change::ClearToEndOfLine(ColorAttribute::Default));
+                } else {
+                    let (col, row) = self.surface.cursor_position();
+                    self.surface.add_change(Change::CursorPosition {
+                        x: Position::Absolute(0),
+                        y: Position::Absolute(row),
+                    });
+                    self.surface.add_change(Change::ClearToEndOfLine(ColorAttribute::Default));
+                    self.surface.add_change(Change::CursorPosition {
+                        x: Position::Absolute(col),
+                        y: Position::Absolute(row),
+                    });
+                }
             }
-            b'P' => {
-                let n = Self::csi_count(params, 0);
-                self.delete_chars(n);
-            }
-            b'X' => {
-                let n = Self::csi_count(params, 0);
-                self.erase_chars(n);
-            }
-            b'J' => self.erase_display(Self::param(params, 0, 0)),
-            b'K' => self.erase_line(Self::param(params, 0, 0)),
             b'L' => {
                 let n = Self::csi_count(params, 0);
                 self.insert_lines(n);
@@ -654,25 +594,29 @@ impl TerminalGrid {
                 let n = Self::csi_count(params, 0);
                 self.scroll_down(n);
             }
-            b'b' => {
-                let n = Self::csi_count(params, 0);
-                self.repeat_last(n);
+            b's' => {
+                let (col, row) = self.surface.cursor_position();
+                self.saved_cursor = (row, col);
             }
-            b's' => self.saved_cursor = (self.cursor_row, self.cursor_col),
-            b'u' => {
-                let (row, col) = self.saved_cursor;
-                self.cursor_row = row.min(self.rows - 1);
-                self.cursor_col = col.min(self.cols - 1);
-            }
+            b'u' => self.restore_saved_cursor(),
             b'r' => self.set_scroll_region(params),
-            b'm' => self.apply_sgr(params),
+            b'm' => {
+                self.apply_sgr_colors(params);
+            }
             b'h' | b'l' => {
                 if private {
                     let set = final_byte == b'h';
                     for param in params.iter() {
                         if let Some(&p) = param.first() {
                             match p {
-                                25 => self.cursor_visible = set,
+                                25 => {
+                                    let visibility = if set {
+                                        CursorVisibility::Visible
+                                    } else {
+                                        CursorVisibility::Hidden
+                                    };
+                                    self.surface.add_change(Change::CursorVisibility(visibility));
+                                }
                                 47 | 1047 => {
                                     if set {
                                         self.enter_alternate(false, false);
@@ -697,140 +641,89 @@ impl TerminalGrid {
         }
     }
 
-    fn erase_display(&mut self, mode: u16) {
-        match mode {
-            2 => self.clear(),
-            3 => self.clear(),
-            0 => {
-                let idx = self.cell_index(self.cursor_row, self.cursor_col);
-                let (fg_kind, bg_kind, underline) = self.current_cell_attrs();
-                for cell in &mut self.cells[idx..] {
-                    cell.ch = ' ';
-                    cell.fg_kind = fg_kind;
-                    cell.bg_kind = bg_kind;
-                    cell.underline = underline;
-                    cell.cont = false;
-                }
-            }
-            1 => {
-                let idx = self.cell_index(self.cursor_row, self.cursor_col);
-                let (fg_kind, bg_kind, underline) = self.current_cell_attrs();
-                for cell in &mut self.cells[..=idx] {
-                    cell.ch = ' ';
-                    cell.fg_kind = fg_kind;
-                    cell.bg_kind = bg_kind;
-                    cell.underline = underline;
-                    cell.cont = false;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn erase_line(&mut self, mode: u16) {
-        let row_start = self.cursor_row * self.cols;
-        match mode {
-            2 => {
-                let (fg_kind, bg_kind, underline) = self.current_cell_attrs();
-                for cell in &mut self.cells[row_start..row_start + self.cols] {
-                    cell.ch = ' ';
-                    cell.fg_kind = fg_kind;
-                    cell.bg_kind = bg_kind;
-                    cell.underline = underline;
-                    cell.cont = false;
-                }
-            }
-            0 => {
-                let idx = row_start + self.cursor_col;
-                let (fg_kind, bg_kind, underline) = self.current_cell_attrs();
-                for cell in &mut self.cells[idx..row_start + self.cols] {
-                    cell.ch = ' ';
-                    cell.fg_kind = fg_kind;
-                    cell.bg_kind = bg_kind;
-                    cell.underline = underline;
-                    cell.cont = false;
-                }
-            }
-            1 => {
-                let idx = row_start + self.cursor_col;
-                let (fg_kind, bg_kind, underline) = self.current_cell_attrs();
-                for cell in &mut self.cells[row_start..=idx] {
-                    cell.ch = ' ';
-                    cell.fg_kind = fg_kind;
-                    cell.bg_kind = bg_kind;
-                    cell.underline = underline;
-                    cell.cont = false;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn reset_attributes(&mut self) {
-        self.cur_fg_kind = ColorKind::Default;
-        self.cur_bg_kind = ColorKind::Default;
-        self.cur_bold = false;
-        self.cur_underline = false;
-        self.cur_inverse = false;
-    }
-
-    fn apply_sgr(&mut self, params: &Params) {
+    fn apply_sgr_colors(&mut self, params: &Params) {
         if params.is_empty() {
-            self.reset_attributes();
+            self.cur_attrs = CellAttributes::default();
+            self.cur_fg_base = None;
+            self.bold = false;
+            self.surface
+                .add_change(Change::AllAttributes(self.cur_attrs.clone()));
             return;
         }
+
         let mut i = 0;
         let params_vec: Vec<u16> = params.iter().filter_map(|p| p.first().copied()).collect();
         while i < params_vec.len() {
             match params_vec[i] {
-                0 => self.reset_attributes(),
-                // Ignore bold/italic so output stays regular.
-                1 | 3 => {}
-                4 => self.cur_underline = true,
-                7 => self.cur_inverse = true,
-                22 | 23 => {}
-                24 => self.cur_underline = false,
-                27 => self.cur_inverse = false,
+                0 => {
+                    self.cur_attrs = CellAttributes::default();
+                    self.cur_fg_base = None;
+                    self.bold = false;
+                }
+                1 => {
+                    self.bold = true;
+                    self.apply_effective_bold_color();
+                }
+                22 => {
+                    self.bold = false;
+                    self.apply_effective_bold_color();
+                }
+                // Ignore italic/underline/reverse and other style changes.
+                3 | 4 | 7 | 23 | 24 | 27 => {}
                 30..=37 => {
-                    self.cur_fg_kind = ColorKind::Ansi((params_vec[i] - 30) as u8);
+                    let idx = (params_vec[i] - 30) as u8;
+                    self.cur_fg_base = Some(idx);
+                    self.apply_effective_bold_color();
                 }
                 40..=47 => {
-                    self.cur_bg_kind = ColorKind::Ansi((params_vec[i] - 40) as u8);
+                    let idx = (params_vec[i] - 40) as u8;
+                    self.cur_attrs.set_background(ColorAttribute::PaletteIndex(idx));
                 }
                 90..=97 => {
-                    self.cur_fg_kind = ColorKind::Ansi((params_vec[i] - 90 + 8) as u8);
+                    let idx = (params_vec[i] - 90 + 8) as u8;
+                    self.cur_fg_base = Some(idx);
+                    self.apply_effective_bold_color();
                 }
                 100..=107 => {
-                    self.cur_bg_kind = ColorKind::Ansi((params_vec[i] - 100 + 8) as u8);
+                    let idx = (params_vec[i] - 100 + 8) as u8;
+                    self.cur_attrs.set_background(ColorAttribute::PaletteIndex(idx));
                 }
                 39 => {
-                    self.cur_fg_kind = ColorKind::Default;
+                    self.cur_attrs.set_foreground(ColorAttribute::Default);
+                    self.cur_fg_base = None;
                 }
                 49 => {
-                    self.cur_bg_kind = ColorKind::Default;
+                    self.cur_attrs.set_background(ColorAttribute::Default);
                 }
                 38 | 48 => {
                     let is_fg = params_vec[i] == 38;
                     if i + 1 < params_vec.len() {
                         match params_vec[i + 1] {
                             5 if i + 2 < params_vec.len() => {
+                                let idx = params_vec[i + 2] as u8;
                                 if is_fg {
-                                    self.cur_fg_kind = ColorKind::Xterm(params_vec[i + 2] as u8);
+                                    self.cur_fg_base = Some(idx);
+                                    self.apply_effective_bold_color();
                                 } else {
-                                    self.cur_bg_kind = ColorKind::Xterm(params_vec[i + 2] as u8);
+                                    self.cur_attrs
+                                        .set_background(ColorAttribute::PaletteIndex(idx));
                                 }
                                 i += 2;
                             }
                             2 if i + 4 < params_vec.len() => {
-                                let r = params_vec[i + 2] as u8;
-                                let g = params_vec[i + 3] as u8;
-                                let b = params_vec[i + 4] as u8;
+                                let r = params_vec[i + 2] as f32 / 255.0;
+                                let g = params_vec[i + 3] as f32 / 255.0;
+                                let b = params_vec[i + 4] as f32 / 255.0;
+                                let color = SrgbaTuple(r, g, b, 1.0);
                                 if is_fg {
-                                    self.cur_fg_kind =
-                                        ColorKind::Rgb(egui::Color32::from_rgb(r, g, b));
+                                    self.cur_fg_base = None;
+                                    self.cur_attrs.set_foreground(
+                                        ColorAttribute::TrueColorWithDefaultFallback(color),
+                                    );
                                 } else {
-                                    self.cur_bg_kind =
-                                        ColorKind::Rgb(egui::Color32::from_rgb(r, g, b));
+                                    self.cur_attrs.set_background(
+                                        ColorAttribute::TrueColorWithDefaultFallback(color),
+                                    );
                                 }
                                 i += 4;
                             }
@@ -842,49 +735,29 @@ impl TerminalGrid {
             }
             i += 1;
         }
-    }
 
-    fn set_scroll_region(&mut self, params: &Params) {
-        let mut top = Self::param(params, 0, 1) as usize;
-        let mut bottom = Self::param(params, 1, self.rows as u16) as usize;
-        if top == 0 {
-            top = 1;
-        }
-        if bottom == 0 {
-            bottom = self.rows;
-        }
-        let top = top.saturating_sub(1).min(self.rows - 1);
-        let bottom = bottom.saturating_sub(1).min(self.rows - 1);
-        if top < bottom {
-            self.scroll_top = top;
-            self.scroll_bottom = bottom;
-        } else {
-            self.scroll_top = 0;
-            self.scroll_bottom = self.rows - 1;
-        }
-        self.cursor_row = self.scroll_top;
-        self.cursor_col = 0;
+        self.surface
+            .add_change(Change::AllAttributes(self.cur_attrs.clone()));
     }
 
     fn ensure_alt_buffer(&mut self) {
-        if self.alt_cells.len() != self.cols * self.rows {
-            self.alt_cells = vec![Cell::default(); self.cols * self.rows];
-            self.alt_cursor_row = 0;
-            self.alt_cursor_col = 0;
+        if self.alt_surface.is_none() {
+            let (cols, rows) = self.surface.dimensions();
+            self.alt_surface = Some(Surface::new(cols, rows));
             self.alt_saved_cursor = (0, 0);
             self.alt_scroll_top = 0;
-            self.alt_scroll_bottom = self.rows - 1;
+            self.alt_scroll_bottom = rows.saturating_sub(1);
         }
     }
 
     fn swap_screens(&mut self) {
-        std::mem::swap(&mut self.cells, &mut self.alt_cells);
-        std::mem::swap(&mut self.cursor_row, &mut self.alt_cursor_row);
-        std::mem::swap(&mut self.cursor_col, &mut self.alt_cursor_col);
-        std::mem::swap(&mut self.saved_cursor, &mut self.alt_saved_cursor);
-        std::mem::swap(&mut self.scroll_top, &mut self.alt_scroll_top);
-        std::mem::swap(&mut self.scroll_bottom, &mut self.alt_scroll_bottom);
-        self.in_alt = !self.in_alt;
+        if let Some(alt) = &mut self.alt_surface {
+            std::mem::swap(&mut self.surface, alt);
+            std::mem::swap(&mut self.saved_cursor, &mut self.alt_saved_cursor);
+            std::mem::swap(&mut self.scroll_top, &mut self.alt_scroll_top);
+            std::mem::swap(&mut self.scroll_bottom, &mut self.alt_scroll_bottom);
+            self.in_alt = !self.in_alt;
+        }
     }
 
     fn enter_alternate(&mut self, save_cursor: bool, clear: bool) {
@@ -892,16 +765,13 @@ impl TerminalGrid {
             return;
         }
         if save_cursor {
-            self.saved_cursor_1049 = Some((self.cursor_row, self.cursor_col));
+            let (col, row) = self.surface.cursor_position();
+            self.saved_cursor_1049 = Some((row, col));
         }
         self.ensure_alt_buffer();
         self.swap_screens();
         if clear {
-            self.clear();
-            self.cursor_row = 0;
-            self.cursor_col = 0;
-            self.scroll_top = 0;
-            self.scroll_bottom = self.rows - 1;
+            self.surface.add_change(Change::ClearScreen(ColorAttribute::Default));
         }
     }
 
@@ -912,116 +782,121 @@ impl TerminalGrid {
         self.swap_screens();
         if restore_cursor {
             if let Some((row, col)) = self.saved_cursor_1049.take() {
-                self.cursor_row = row.min(self.rows - 1);
-                self.cursor_col = col.min(self.cols - 1);
+                self.surface.add_change(Change::CursorPosition {
+                    x: Position::Absolute(col),
+                    y: Position::Absolute(row),
+                });
             }
         }
     }
 
-    fn reset(&mut self) {
-        if self.in_alt {
-            self.exit_alternate(false);
-        }
-        self.cur_fg_kind = ColorKind::Default;
-        self.cur_bg_kind = ColorKind::Default;
-        self.cur_bold = false;
-        self.cur_underline = false;
-        self.cur_inverse = false;
-        self.g0 = Charset::Ascii;
-        self.g1 = Charset::Ascii;
-        self.use_g1 = false;
-        self.cursor_visible = true;
-        self.saved_cursor = (0, 0);
-        self.scroll_top = 0;
-        self.scroll_bottom = self.rows - 1;
-        self.last_printable = None;
-        self.default_fg = DEFAULT_FG;
-        self.default_bg = DEFAULT_BG;
-        self.cursor_color = None;
-        self.palette = [None; 256];
-        self.clear();
-        self.cursor_row = 0;
-        self.cursor_col = 0;
+    fn param(params: &Params, idx: usize, default: u16) -> u16 {
+        params
+            .get(idx)
+            .and_then(|p| p.first().copied())
+            .unwrap_or(default)
     }
 
-    fn effective_color_kinds(&self) -> (ColorKind, ColorKind) {
-        let mut fg = self.cur_fg_kind;
-        let mut bg = self.cur_bg_kind;
-        if self.cur_bold {
-            if let ColorKind::Ansi(idx) = fg
-                && idx < 8
-            {
-                fg = ColorKind::Ansi(idx + 8);
+    fn csi_count(params: &Params, idx: usize) -> usize {
+        let mut n = Self::param(params, idx, 1);
+        if n == 0 {
+            n = 1;
+        }
+        n as usize
+    }
+
+    fn csi_position(params: &Params, idx: usize, max: usize) -> usize {
+        let mut v = Self::param(params, idx, 1);
+        if v == 0 {
+            v = 1;
+        }
+        (v as usize).saturating_sub(1).min(max)
+    }
+
+    fn parse_csi_string(s: &str) -> Option<(u8, Params, bool)> {
+        let bytes = s.as_bytes();
+        if bytes.is_empty() {
+            return None;
+        }
+        let mut idx = if bytes.starts_with(&[0x1b, b'[']) {
+            2
+        } else if bytes[0] == 0x9b {
+            1
+        } else {
+            return None;
+        };
+
+        let mut private = false;
+        if idx < bytes.len() && bytes[idx] == b'?' {
+            private = true;
+            idx += 1;
+        }
+
+        let mut final_idx = None;
+        for i in idx..bytes.len() {
+            let b = bytes[i];
+            if (0x40..=0x7e).contains(&b) {
+                final_idx = Some(i);
+                break;
             }
         }
-        if self.cur_inverse {
-            std::mem::swap(&mut fg, &mut bg);
-        }
-        (fg, bg)
-    }
+        let final_idx = final_idx?;
+        let final_byte = bytes[final_idx];
 
-    fn current_cell_attrs(&self) -> (ColorKind, ColorKind, bool) {
-        let (fg, bg) = self.effective_color_kinds();
-        (fg, bg, self.cur_underline)
-    }
+        let mut params: Params = Vec::new();
+        let mut current: Vec<u16> = Vec::new();
+        let mut num: Option<u16> = None;
+        let mut saw_param = false;
 
-    fn resolve_color(&self, kind: ColorKind, is_fg: bool) -> egui::Color32 {
-        match kind {
-            ColorKind::Default => {
-                if is_fg {
-                    self.default_fg
-                } else {
-                    self.default_bg
+        for &b in &bytes[idx..final_idx] {
+            match b {
+                b'0'..=b'9' => {
+                    saw_param = true;
+                    let digit = (b - b'0') as u16;
+                    num = Some(num.unwrap_or(0).saturating_mul(10).saturating_add(digit));
                 }
-            }
-            ColorKind::Ansi(idx) => {
-                if let Some(color) = self.palette[idx as usize] {
-                    color
-                } else {
-                    ansi_16_color(idx)
+                b':' => {
+                    saw_param = true;
+                    if let Some(value) = num.take() {
+                        current.push(value);
+                    } else {
+                        current.push(0);
+                    }
                 }
-            }
-            ColorKind::Xterm(idx) => {
-                if let Some(color) = self.palette[idx as usize] {
-                    color
-                } else {
-                    xterm_256_color(idx)
+                b';' => {
+                    saw_param = true;
+                    if let Some(value) = num.take() {
+                        current.push(value);
+                    }
+                    params.push(std::mem::take(&mut current));
                 }
+                _ => {}
             }
-            ColorKind::Rgb(color) => color,
         }
-    }
-}
-
-impl Perform for TerminalGrid {
-    fn print(&mut self, c: char) {
-        let ch = self.map_charset_char(c);
-        self.put_char(ch);
-    }
-
-    fn execute(&mut self, byte: u8) {
-        match byte {
-            0x08 => self.backspace(),
-            0x09 => self.tab(),
-            0x0a => self.newline(),
-            0x0d => self.carriage_return(),
-            0x0e => self.use_g1 = true,
-            0x0f => self.use_g1 = false,
-            _ => {}
+        if let Some(value) = num.take() {
+            current.push(value);
         }
+        if saw_param || !current.is_empty() {
+            params.push(current);
+        }
+
+        Some((final_byte, params, private))
     }
 
-    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _c: char) {}
+    fn apply_effective_bold_color(&mut self) {
+        let Some(base) = self.cur_fg_base else {
+            return;
+        };
+        let effective = if self.bold && base < 8 { base + 8 } else { base };
+        self.cur_attrs
+            .set_foreground(ColorAttribute::PaletteIndex(effective));
+    }
 
-    fn put(&mut self, _byte: u8) {}
-
-    fn unhook(&mut self) {}
-
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+    fn osc_dispatch(&mut self, params: &[Vec<u8>]) {
         if params.is_empty() {
             return;
         }
-        let Ok(cmd) = std::str::from_utf8(params[0]) else {
+        let Ok(cmd) = std::str::from_utf8(&params[0]) else {
             return;
         };
         let Ok(cmd_num) = cmd.parse::<u16>() else {
@@ -1029,14 +904,13 @@ impl Perform for TerminalGrid {
         };
 
         match cmd_num {
-            0 | 2 => {}
             4 => {
                 if params.len() < 2 {
                     return;
                 }
                 let mut i = 1;
                 while i + 1 < params.len() {
-                    let Ok(idx_str) = std::str::from_utf8(params[i]) else {
+                    let Ok(idx_str) = std::str::from_utf8(&params[i]) else {
                         i += 2;
                         continue;
                     };
@@ -1048,7 +922,7 @@ impl Perform for TerminalGrid {
                         i += 2;
                         continue;
                     }
-                    let Ok(spec) = std::str::from_utf8(params[i + 1]) else {
+                    let Ok(spec) = std::str::from_utf8(&params[i + 1]) else {
                         i += 2;
                         continue;
                     };
@@ -1056,7 +930,7 @@ impl Perform for TerminalGrid {
                         i += 2;
                         continue;
                     }
-                    if let Some(color) = parse_color_spec(spec) {
+                    if let Some(color) = Self::parse_osc_color(spec) {
                         self.palette[idx] = Some(color);
                     }
                     i += 2;
@@ -1066,13 +940,13 @@ impl Perform for TerminalGrid {
                 if params.len() < 2 {
                     return;
                 }
-                let Ok(spec) = std::str::from_utf8(params[1]) else {
+                let Ok(spec) = std::str::from_utf8(&params[1]) else {
                     return;
                 };
                 if spec == "?" {
                     return;
                 }
-                if let Some(color) = parse_color_spec(spec) {
+                if let Some(color) = Self::parse_osc_color(spec) {
                     match cmd_num {
                         10 => self.default_fg = color,
                         11 => self.default_bg = color,
@@ -1105,48 +979,67 @@ impl Perform for TerminalGrid {
         }
     }
 
-    fn csi_dispatch(
-        &mut self,
-        params: &Params,
-        intermediates: &[u8],
-        ignore: bool,
-        c: char,
-    ) {
-        if ignore {
-            return;
+    fn parse_osc_color(spec: &str) -> Option<egui::Color32> {
+        let spec = spec.trim();
+        if spec.eq_ignore_ascii_case("none") {
+            return None;
         }
-        
-        // Check if this is a private mode (prefixed with '?')
-        let private = !intermediates.is_empty() && intermediates[0] == b'?';
-        
-        self.execute_csi(c as u8, params, private);
+        if let Some(rest) = spec.strip_prefix("rgb:") {
+            let comps: Vec<&str> = rest.split('/').collect();
+            if comps.len() < 3 {
+                return None;
+            }
+            let r = Self::parse_hex_component(comps[0])?;
+            let g = Self::parse_hex_component(comps[1])?;
+            let b = Self::parse_hex_component(comps[2])?;
+            return Some(egui::Color32::from_rgb(r, g, b));
+        }
+        if let Some(hex) = spec.strip_prefix('#') {
+            if hex.len() % 3 != 0 {
+                return None;
+            }
+            let step = hex.len() / 3;
+            if step == 0 || step > 4 {
+                return None;
+            }
+            let r = Self::parse_hex_component(&hex[0..step])?;
+            let g = Self::parse_hex_component(&hex[step..step * 2])?;
+            let b = Self::parse_hex_component(&hex[step * 2..step * 3])?;
+            return Some(egui::Color32::from_rgb(r, g, b));
+        }
+        None
     }
 
-    fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
-        match (intermediates, byte) {
-            ([], b'D') => self.newline(),
-            ([], b'M') => {
-                if self.cursor_row <= self.scroll_top {
-                    self.scroll_down(1);
-                } else {
-                    self.cursor_row = self.cursor_row.saturating_sub(1);
-                }
-            }
-            ([], b'E') => {
-                self.newline();
-                self.carriage_return();
-            }
-            ([], b'c') => self.reset(),
-            ([], b'7') => self.saved_cursor = (self.cursor_row, self.cursor_col),
-            ([], b'8') => {
-                let (row, col) = self.saved_cursor;
-                self.cursor_row = row.min(self.rows - 1);
-                self.cursor_col = col.min(self.cols - 1);
-            }
-            ([i], designator) if *i == b'(' || *i == b')' => {
-                self.select_charset(*i, designator);
-            }
-            _ => {}
+    fn parse_hex_component(comp: &str) -> Option<u8> {
+        if comp.is_empty() || comp.len() > 4 {
+            return None;
         }
+        let value = u32::from_str_radix(comp, 16).ok()?;
+        let max = (1u32 << (comp.len() * 4)) - 1;
+        let scaled = (value.saturating_mul(255) + max / 2) / max;
+        Some(scaled as u8)
+    }
+
+    fn parse_osc_string(s: &str) -> Option<Vec<Vec<u8>>> {
+        let mut text = s;
+        if let Some(rest) = text.strip_prefix("\u{1b}]") {
+            text = rest;
+        } else if let Some(rest) = text.strip_prefix("\u{9d}") {
+            text = rest;
+        } else {
+            return None;
+        }
+
+        if let Some(rest) = text.strip_suffix("\u{1b}\\") {
+            text = rest;
+        } else if let Some(rest) = text.strip_suffix('\u{7}') {
+            text = rest;
+        }
+
+        let params = text
+            .split(';')
+            .map(|part| part.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        Some(params)
     }
 }
