@@ -8,7 +8,7 @@ eframe = "0.33.3"
 image = "0.25"
 nix = { version = "0.31.1", features = ["term"] }
 unicode-width = "0.2"
-termwiz = "0.23.3"
+vt100 = "0.15"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.3"

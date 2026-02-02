@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 
 #[cfg(not(target_os = "macos"))]
-pub use egui_keymap::*;
+pub(crate) use egui_keymap::*;
 #[cfg(target_os = "macos")]
-pub use macos_keymap::*;
+pub(crate) use macos_keymap::*;
 
 #[cfg(not(target_os = "macos"))]
 pub mod egui_keymap {

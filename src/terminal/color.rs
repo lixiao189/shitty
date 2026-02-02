@@ -1,8 +1,4 @@
 use eframe::egui::{self, Color32};
-use termwiz::color::SrgbaTuple;
-
-pub(crate) const DEFAULT_FG_SRGBA: SrgbaTuple = SrgbaTuple(0.8, 0.8, 0.8, 1.0);
-pub(crate) const DEFAULT_BG_SRGBA: SrgbaTuple = SrgbaTuple(0.0, 0.0, 0.0, 1.0);
 
 pub(crate) const DEFAULT_FG: Color32 = Color32::from_rgba_premultiplied(204, 204, 204, 255);
 pub(crate) const DEFAULT_BG: Color32 = Color32::BLACK;

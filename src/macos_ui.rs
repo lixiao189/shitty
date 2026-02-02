@@ -17,12 +17,9 @@ use objc2_foundation::{
     NSString,
 };
 
-use std::mem;
 use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
 use std::sync::mpsc::{Receiver, Sender};
-use termwiz::cell::{CellAttributes, Intensity};
-use termwiz::color::{ColorAttribute, SrgbaTuple};
 
 /// Holds the Rust-side state for our terminal view.
 struct TerminalViewState {
@@ -121,7 +118,7 @@ define_class!(
     unsafe impl NSWindowDelegate for ShittyAppDelegate {
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _notification: &AnyObject) {
-            unsafe { NSApplication::sharedApplication(self.mtm()).terminate(None) };
+            NSApplication::sharedApplication(self.mtm()).terminate(None);
         }
     }
 );
@@ -285,32 +282,35 @@ define_class!(
                 .map(|window| window.backingScaleFactor())
                 .unwrap_or(1.0);
 
-            let default_bg = to_nscolor(state.grid.default_bg_color());
-            let default_bg_srgba = state.grid.default_bg_color();
-            default_bg.set();
+            let default_bg = state.grid.default_bg();
+            to_nscolor(default_bg).set();
             NSBezierPath::fillRect(bounds);
 
-            let lines = state.grid.screen_lines();
+            let rows = state.grid.rows();
+            let cols = state.grid.cols();
 
-            for (row, line) in lines.iter().enumerate() {
+            for row in 0..rows {
                 let mut col = 0;
-                while col < state.grid.cols() {
-                    let cell_ref = line.get_cell(col).map(|cell| cell.as_cell());
-                    let (cell_text, attrs, run_width) = if let Some(cell) = &cell_ref {
-                        (cell.str(), cell.attrs(), cell.width().max(1) as usize)
-                    } else {
-                        ("", &CellAttributes::default(), 1)
-                    };
+                while col < cols {
+                    let cell = state.grid.get_cell(row, col);
+                    let (cell_text, fg, bg, underline, run_width, skip_cell) =
+                        if let Some(cell) = &cell {
+                            (
+                                cell.text.as_str(),
+                                cell.fg,
+                                cell.bg,
+                                cell.underline,
+                                if cell.wide { 2 } else { 1 },
+                                cell.wide_continuation,
+                            )
+                        } else {
+                            ("", egui::Color32::WHITE, default_bg, false, 1, false)
+                        };
 
-                    let (fg_srgba, bg_srgba) = resolve_cell_colors(
-                        attrs,
-                        state.grid.default_fg_color(),
-                        state.grid.default_bg_color(),
-                    );
-                    let fg = to_nscolor(fg_srgba);
-                    let bg = to_nscolor(bg_srgba);
-
-                    let run_text = cell_text;
+                    if skip_cell {
+                        col = col.saturating_add(1);
+                        continue;
+                    }
 
                     let x0 = snap_to_pixel(origin.x + col as f64 * cell_w, scale);
                     let x1 = snap_to_pixel(
@@ -333,37 +333,45 @@ define_class!(
 
                     let rect = NSRect::new(NSPoint::new(x0, y0), NSSize::new(rect_w, rect_h));
 
-                    if bg_srgba != default_bg_srgba {
-                        bg.set();
+                    if bg != default_bg {
+                        to_nscolor(bg).set();
                         NSBezierPath::fillRect(rect);
                     }
 
-                    if !run_text.is_empty() && run_text != " " {
-                        let text = NSString::from_str(run_text);
+                    if !cell_text.is_empty() && cell_text != " " {
+                        let text = NSString::from_str(cell_text);
                         let text_pos = NSPoint::new(x0, snap_to_pixel(text_y_pos, scale));
+                        let fg_color = to_nscolor(fg);
 
                         let text_attributes: Retained<
                             NSDictionary<NSAttributedStringKey, AnyObject>,
                         > = unsafe {
                             NSDictionary::dictionaryWithObject_forKey(
-                                unsafe { cast_any_object(&*fg) },
+                                cast_any_object(&*fg_color),
                                 ProtocolObject::from_ref(
                                     objc2_app_kit::NSForegroundColorAttributeName,
                                 ),
                             )
                         };
-                        let text_attributes = unsafe {
-                            NSMutableDictionary::dictionaryWithDictionary(&text_attributes)
-                        };
+                        let text_attributes =
+                            NSMutableDictionary::dictionaryWithDictionary(&text_attributes);
                         unsafe {
                             text_attributes.setObject_forKey(
-                                unsafe { cast_any_object(&*state.font) },
+                                cast_any_object(&*state.font),
                                 ProtocolObject::from_ref(objc2_app_kit::NSFontAttributeName),
                             )
                         };
-                        unsafe {
-                            text.drawAtPoint_withAttributes(text_pos, Some(&text_attributes))
-                        };
+                        unsafe { text.drawAtPoint_withAttributes(text_pos, Some(&text_attributes)) };
+                    }
+
+                    if underline {
+                        let underline_y = y0 + rect_h - 1.0;
+                        let underline_rect = NSRect::new(
+                            NSPoint::new(x0, underline_y),
+                            NSSize::new(rect_w, 1.0),
+                        );
+                        to_nscolor(fg).set();
+                        NSBezierPath::fillRect(underline_rect);
                     }
 
                     col = col.saturating_add(run_width.max(1));
@@ -372,83 +380,74 @@ define_class!(
 
             if state.grid.cursor_visible() {
                 let (cursor_row, cursor_col) = state.grid.cursor_pos();
-                if let Some(line) = lines.get(cursor_row) {
-                    let cell = line
-                        .get_cell(cursor_col)
-                        .map(|cell| cell.as_cell());
-                    let (cell_text, attrs) = if let Some(cell) = &cell {
-                        (cell.str(), cell.attrs())
+                let cursor_cell = state.grid.get_cell(cursor_row, cursor_col);
+                let (cell_text, cell_fg, cell_bg) = cursor_cell
+                    .as_ref()
+                    .map(|cell| {
+                        let (fg, bg) = state.grid.resolve_cell_colors(cell);
+                        (cell.text.as_str(), fg, bg)
+                    })
+                    .unwrap_or((" ", egui::Color32::WHITE, default_bg));
+                let cursor_bg = state.grid.cursor_color().unwrap_or_else(|| {
+                    if cell_fg == cell_bg {
+                        egui::Color32::WHITE
                     } else {
-                        (" ", &CellAttributes::default())
-                    };
-                    let (fg_srgba, bg_srgba) = resolve_cell_colors(
-                        attrs,
-                        state.grid.default_fg_color(),
-                        state.grid.default_bg_color(),
-                    );
-                    let cursor_bg_srgba = state
-                        .grid
-                        .cursor_color()
-                        .map(color32_to_srgba)
-                        .unwrap_or_else(|| {
-                            if fg_srgba == bg_srgba {
-                                SrgbaTuple(1.0, 1.0, 1.0, 1.0)
-                            } else {
-                                fg_srgba
-                            }
-                        });
-                    let cursor_fg_srgba = if cursor_bg_srgba == bg_srgba {
-                        fg_srgba
-                    } else {
-                        bg_srgba
-                    };
-                    let cursor_x0 = snap_to_pixel(origin.x + cursor_col as f64 * cell_w, scale);
-                    let cursor_x1 =
-                        snap_to_pixel(origin.x + (cursor_col + 1) as f64 * cell_w, scale);
-                    let cursor_y0 = snap_to_pixel(
-                        origin.y + bounds.size.height - ((cursor_row + 1) as f64 * cell_h),
-                        scale,
-                    );
-                    let cursor_y1 =
-                        snap_to_pixel(origin.y + bounds.size.height - (cursor_row as f64 * cell_h), scale);
-                    let cursor_rect = NSRect::new(
-                        NSPoint::new(cursor_x0, cursor_y0),
-                        NSSize::new(
-                            (cursor_x1 - cursor_x0).max(0.0),
-                            (cursor_y1 - cursor_y0).max(0.0),
-                        ),
-                    );
-                    let cursor_bg = to_nscolor(cursor_bg_srgba);
-                    let cursor_fg = to_nscolor(cursor_fg_srgba);
-                    cursor_bg.set();
-                    NSBezierPath::fillRect(cursor_rect);
+                        cell_fg
+                    }
+                });
+                let cursor_fg = if cursor_bg == cell_bg {
+                    cell_fg
+                } else {
+                    cell_bg
+                };
+                let cursor_x0 = snap_to_pixel(origin.x + cursor_col as f64 * cell_w, scale);
+                let cursor_x1 =
+                    snap_to_pixel(origin.x + (cursor_col + 1) as f64 * cell_w, scale);
+                let cursor_y0 = snap_to_pixel(
+                    origin.y + bounds.size.height - ((cursor_row + 1) as f64 * cell_h),
+                    scale,
+                );
+                let cursor_y1 = snap_to_pixel(
+                    origin.y + bounds.size.height - (cursor_row as f64 * cell_h),
+                    scale,
+                );
+                let cursor_rect = NSRect::new(
+                    NSPoint::new(cursor_x0, cursor_y0),
+                    NSSize::new(
+                        (cursor_x1 - cursor_x0).max(0.0),
+                        (cursor_y1 - cursor_y0).max(0.0),
+                    ),
+                );
+                let cursor_bg = to_nscolor(cursor_bg);
+                let cursor_fg = to_nscolor(cursor_fg);
+                cursor_bg.set();
+                NSBezierPath::fillRect(cursor_rect);
 
-                    let cursor_rect_h = (cursor_y1 - cursor_y0).max(0.0);
-                    let font_height = state.font.ascender() as f64 - state.font.descender() as f64;
-                    let text_pos = NSPoint::new(
-                        cursor_x0,
-                        snap_to_pixel(cursor_y0 + (cursor_rect_h - font_height) / 2.0, scale),
-                    );
-                    let text = NSString::from_str(cell_text);
-                    let text_attributes: Retained<NSDictionary<NSAttributedStringKey, AnyObject>> =
-                        unsafe {
-                            NSDictionary::dictionaryWithObject_forKey(
-                                unsafe { cast_any_object(&*cursor_fg) },
-                                ProtocolObject::from_ref(
-                                    objc2_app_kit::NSForegroundColorAttributeName,
-                                ),
-                            )
-                        };
-                    let text_attributes =
-                        unsafe { NSMutableDictionary::dictionaryWithDictionary(&text_attributes) };
+                let cursor_rect_h = (cursor_y1 - cursor_y0).max(0.0);
+                let font_height = state.font.ascender() as f64 - state.font.descender() as f64;
+                let text_pos = NSPoint::new(
+                    cursor_x0,
+                    snap_to_pixel(cursor_y0 + (cursor_rect_h - font_height) / 2.0, scale),
+                );
+                let text = NSString::from_str(cell_text);
+                let text_attributes: Retained<NSDictionary<NSAttributedStringKey, AnyObject>> =
                     unsafe {
-                        text_attributes.setObject_forKey(
-                            unsafe { cast_any_object(&*state.font) },
-                            ProtocolObject::from_ref(objc2_app_kit::NSFontAttributeName),
+                        NSDictionary::dictionaryWithObject_forKey(
+                            cast_any_object(&*cursor_fg),
+                            ProtocolObject::from_ref(
+                                objc2_app_kit::NSForegroundColorAttributeName,
+                            ),
                         )
                     };
-                    unsafe { text.drawAtPoint_withAttributes(text_pos, Some(&text_attributes)) };
-                }
+                let text_attributes =
+                    NSMutableDictionary::dictionaryWithDictionary(&text_attributes);
+                unsafe {
+                    text_attributes.setObject_forKey(
+                        cast_any_object(&*state.font),
+                        ProtocolObject::from_ref(objc2_app_kit::NSFontAttributeName),
+                    )
+                };
+                unsafe { text.drawAtPoint_withAttributes(text_pos, Some(&text_attributes)) };
             }
         }
     }
@@ -572,9 +571,12 @@ fn set_winsize_raw(fd: i32, cols: u16, rows: u16) {
     }
 }
 
-// Helper to convert termwiz colors to NSColor.
-fn to_nscolor(c: SrgbaTuple) -> Retained<NSColor> {
-    let (r, g, b, a) = c.to_srgb_u8();
+// Helper to convert egui colors to NSColor.
+fn to_nscolor(c: egui::Color32) -> Retained<NSColor> {
+    let r = c.r();
+    let g = c.g();
+    let b = c.b();
+    let a = c.a();
     NSColor::colorWithSRGBRed_green_blue_alpha(
         r as f64 / 255.0,
         g as f64 / 255.0,
@@ -583,94 +585,9 @@ fn to_nscolor(c: SrgbaTuple) -> Retained<NSColor> {
     )
 }
 
-// Helper to resolve cell attributes to foreground and background NSColors.
-fn resolve_cell_colors(
-    attrs: &CellAttributes,
-    default_fg: SrgbaTuple,
-    default_bg: SrgbaTuple,
-) -> (SrgbaTuple, SrgbaTuple) {
-    let mut final_fg = match attrs.foreground() {
-        ColorAttribute::Default => default_fg,
-        ColorAttribute::PaletteIndex(i) => ansi_palette_color(i),
-        ColorAttribute::TrueColorWithDefaultFallback(c) => c.into(),
-        ColorAttribute::TrueColorWithPaletteFallback(c, _) => c.into(),
-    };
-
-    let mut final_bg = match attrs.background() {
-        ColorAttribute::Default => default_bg,
-        ColorAttribute::PaletteIndex(i) => ansi_palette_color(i),
-        ColorAttribute::TrueColorWithDefaultFallback(c) => c.into(),
-        ColorAttribute::TrueColorWithPaletteFallback(c, _) => c.into(),
-    };
-
-    if attrs.intensity() == Intensity::Bold {
-        if let ColorAttribute::PaletteIndex(idx @ 0..=7) = attrs.foreground() {
-            final_fg = ansi_palette_color(idx + 8);
-        }
-    }
-
-    if attrs.reverse() {
-        mem::swap(&mut final_fg, &mut final_bg);
-    }
-
-    (final_fg, final_bg)
-}
-
-fn color32_to_srgba(color: egui::Color32) -> SrgbaTuple {
-    let r = color.r() as f32 / 255.0;
-    let g = color.g() as f32 / 255.0;
-    let b = color.b() as f32 / 255.0;
-    let a = color.a() as f32 / 255.0;
-    SrgbaTuple(r, g, b, a)
-}
-
 fn snap_to_pixel(value: f64, scale: f64) -> f64 {
     if scale <= 0.0 {
         return value;
     }
     (value * scale).round() / scale
 }
-
-fn ansi_palette_color(index: u8) -> SrgbaTuple {
-    if index < 16 {
-        return ansi_16_srgba(index);
-    }
-    if index < 232 {
-        let idx = index - 16;
-        let r = idx / 36;
-        let g = (idx / 6) % 6;
-        let b = idx % 6;
-        return SrgbaTuple(
-            RGB_LEVELS[r as usize] as f32 / 255.0,
-            RGB_LEVELS[g as usize] as f32 / 255.0,
-            RGB_LEVELS[b as usize] as f32 / 255.0,
-            1.0,
-        );
-    }
-    let gray = 8u8.saturating_add((index - 232).saturating_mul(10));
-    let channel = gray as f32 / 255.0;
-    SrgbaTuple(channel, channel, channel, 1.0)
-}
-
-fn ansi_16_srgba(index: u8) -> SrgbaTuple {
-    match index {
-        0 => SrgbaTuple(0.0, 0.0, 0.0, 1.0),
-        1 => SrgbaTuple(0.5, 0.0, 0.0, 1.0),
-        2 => SrgbaTuple(0.0, 0.5, 0.0, 1.0),
-        3 => SrgbaTuple(0.5, 0.5, 0.0, 1.0),
-        4 => SrgbaTuple(0.0, 0.0, 0.5, 1.0),
-        5 => SrgbaTuple(0.5, 0.0, 0.5, 1.0),
-        6 => SrgbaTuple(0.0, 0.5, 0.5, 1.0),
-        7 => SrgbaTuple(0.75, 0.75, 0.75, 1.0),
-        8 => SrgbaTuple(0.5, 0.5, 0.5, 1.0),
-        9 => SrgbaTuple(1.0, 0.0, 0.0, 1.0),
-        10 => SrgbaTuple(0.0, 1.0, 0.0, 1.0),
-        11 => SrgbaTuple(1.0, 1.0, 0.0, 1.0),
-        12 => SrgbaTuple(0.0, 0.0, 1.0, 1.0),
-        13 => SrgbaTuple(1.0, 0.0, 1.0, 1.0),
-        14 => SrgbaTuple(0.0, 1.0, 1.0, 1.0),
-        _ => SrgbaTuple(1.0, 1.0, 1.0, 1.0),
-    }
-}
-
-const RGB_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
