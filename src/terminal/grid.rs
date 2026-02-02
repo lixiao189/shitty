@@ -1,13 +1,15 @@
 use eframe::egui;
 use termwiz::cell::{CellAttributes, Intensity, Underline};
 use termwiz::color::{ColorAttribute, ColorSpec, SrgbaTuple};
-use termwiz::escape::csi::{Sgr, CSI};
+use termwiz::escape::csi::{CSI, Sgr};
 use termwiz::escape::osc::{ColorOrQuery, DynamicColorNumber};
 use termwiz::escape::parser::Parser;
 use termwiz::escape::{Action, ControlCode, Esc, EscCode, OperatingSystemCommand};
-use termwiz::surface::{Change, CursorVisibility, Line, Position, SequenceNo, Surface, SEQ_ZERO};
+use termwiz::surface::{Change, CursorVisibility, Line, Position, SEQ_ZERO, SequenceNo, Surface};
 
-use crate::terminal::color::{xterm_256_color, DEFAULT_BG, DEFAULT_FG};
+use crate::terminal::color::{
+    DEFAULT_BG, DEFAULT_BG_SRGBA, DEFAULT_FG, DEFAULT_FG_SRGBA, xterm_256_color,
+};
 
 const TAB_SIZE: usize = 8;
 
@@ -107,6 +109,14 @@ impl TerminalGrid {
 
     pub(crate) fn default_bg(&self) -> egui::Color32 {
         self.default_bg
+    }
+
+    pub(crate) fn default_fg_color(&self) -> SrgbaTuple {
+        DEFAULT_FG_SRGBA
+    }
+
+    pub(crate) fn default_bg_color(&self) -> SrgbaTuple {
+        DEFAULT_BG_SRGBA
     }
 
     pub(crate) fn cursor_visible(&self) -> bool {
@@ -349,11 +359,7 @@ impl TerminalGrid {
     }
 
     fn current_charset(&self) -> Charset {
-        if self.use_g1 {
-            self.g1
-        } else {
-            self.g0
-        }
+        if self.use_g1 { self.g1 } else { self.g0 }
     }
 
     fn select_charset(&mut self, slot: u8, designator: u8) {
