@@ -165,7 +165,7 @@ impl eframe::App for TerminalUI {
                         }
 
                         if let Some(cell) = &cell {
-                            if self.grid.cell_underline(cell) {
+                            if cell.underline {
                                 let y = pos.y + cell_h - 1.0;
                                 let rect = egui::Rect::from_min_size(
                                     egui::pos2(pos.x, y),

@@ -1,7 +1,7 @@
-use eframe::egui;
+use eframe::egui::{self, Color32};
 
-pub(crate) const DEFAULT_FG: egui::Color32 = egui::Color32::WHITE;
-pub(crate) const DEFAULT_BG: egui::Color32 = egui::Color32::BLACK;
+pub(crate) const DEFAULT_FG: Color32 = Color32::from_rgba_premultiplied(204, 204, 204, 255);
+pub(crate) const DEFAULT_BG: Color32 = Color32::BLACK;
 
 // Lookup table for RGB levels used in xterm 256 color mode
 const RGB_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];

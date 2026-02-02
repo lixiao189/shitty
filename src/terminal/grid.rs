@@ -96,6 +96,8 @@ impl TerminalGrid {
             italic: cell.italic(),
             underline: cell.underline(),
             inverse: cell.inverse(),
+            wide: cell.is_wide(),
+            wide_continuation: cell.is_wide_continuation(),
         })
     }
 
@@ -106,10 +108,6 @@ impl TerminalGrid {
             (cell.fg, cell.bg)
         };
         (fg, bg)
-    }
-
-    pub(crate) fn cell_underline(&self, cell: &CellInfo) -> bool {
-        cell.underline
     }
 
     fn resolve_color(&self, color: vt100::Color, is_fg: bool) -> egui::Color32 {
@@ -144,4 +142,6 @@ pub(crate) struct CellInfo {
     pub italic: bool,
     pub underline: bool,
     pub inverse: bool,
+    pub wide: bool,
+    pub wide_continuation: bool,
 }
