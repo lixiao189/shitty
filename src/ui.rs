@@ -137,56 +137,53 @@ impl eframe::App for TerminalUI {
 
                 painter.rect_filled(rect, 0.0, self.grid.default_bg());
 
-                let lines = self.grid.screen_lines();
                 let default_bg = self.grid.default_bg();
-                let default_attrs = termwiz::cell::CellAttributes::default();
 
                 // Cache font_id reference to avoid cloning in loop
                 let font_id = &self.font_id;
 
-                for (row, line) in lines.iter().enumerate() {
-                    let mut col = 0usize;
-                    while col < cols {
-                        let cell_ref = line.get_cell(col);
-                        let cell = cell_ref.map(|c| c.as_cell());
-                        let (text, attrs, width) = if let Some(cell) = &cell {
-                            (cell.str(), cell.attrs(), cell.width().max(1) as usize)
+                // Render all cells
+                for row in 0..rows {
+                    for col in 0..cols {
+                        let cell = self.grid.get_cell(row, col);
+                        let (text, fg, bg) = if let Some(cell) = &cell {
+                            let (fg, bg) = self.grid.resolve_cell_colors(cell);
+                            (cell.text.as_str(), fg, bg)
                         } else {
-                            ("", &default_attrs, 1)
+                            ("", egui::Color32::WHITE, default_bg)
                         };
-                        let (fg, bg) = self.grid.resolve_cell_colors(attrs);
+
                         let pos = grid_to_screen(origin, cell_w, cell_h, row, col);
-                        let rect = egui::Rect::from_min_size(
-                            pos,
-                            egui::vec2(cell_w * width as f32, cell_h),
-                        );
+                        let rect = egui::Rect::from_min_size(pos, egui::vec2(cell_w, cell_h));
+
                         if bg != default_bg {
                             painter.rect_filled(rect, 0.0, bg);
                         }
+
                         if !text.is_empty() && text != " " {
                             painter.text(pos, egui::Align2::LEFT_TOP, text, font_id.clone(), fg);
                         }
-                        if self.grid.cell_underline(attrs) {
-                            let y = pos.y + cell_h - 1.0;
-                            let rect = egui::Rect::from_min_size(
-                                egui::pos2(pos.x, y),
-                                egui::vec2(cell_w * width as f32, 1.0),
-                            );
-                            painter.rect_filled(rect, 0.0, fg);
+
+                        if let Some(cell) = &cell {
+                            if self.grid.cell_underline(cell) {
+                                let y = pos.y + cell_h - 1.0;
+                                let rect = egui::Rect::from_min_size(
+                                    egui::pos2(pos.x, y),
+                                    egui::vec2(cell_w, 1.0),
+                                );
+                                painter.rect_filled(rect, 0.0, fg);
+                            }
                         }
-                        col = col.saturating_add(width.max(1));
                     }
                 }
 
+                // Render cursor
                 if self.grid.cursor_visible() {
                     let (cursor_row, cursor_col) = self.grid.cursor_pos();
-                    let cursor_cell = lines
-                        .get(cursor_row)
-                        .and_then(|line| line.get_cell(cursor_col))
-                        .map(|cell| cell.as_cell());
+                    let cursor_cell = self.grid.get_cell(cursor_row, cursor_col);
                     let (cell_fg, cell_bg) = cursor_cell
                         .as_ref()
-                        .map(|cell| self.grid.resolve_cell_colors(cell.attrs()))
+                        .map(|cell| self.grid.resolve_cell_colors(cell))
                         .unwrap_or((egui::Color32::WHITE, self.grid.default_bg()));
                     let cursor_pos = grid_to_screen(origin, cell_w, cell_h, cursor_row, cursor_col);
                     let cursor_rect =
@@ -207,7 +204,10 @@ impl eframe::App for TerminalUI {
                     painter.text(
                         cursor_pos,
                         egui::Align2::LEFT_TOP,
-                        cursor_cell.as_ref().map(|cell| cell.str()).unwrap_or(" "),
+                        cursor_cell
+                            .as_ref()
+                            .map(|cell| cell.text.as_str())
+                            .unwrap_or(" "),
                         font_id.clone(),
                         cursor_fg,
                     );
