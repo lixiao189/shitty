@@ -141,16 +141,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (tx_input, rx_input) = channel::<Vec<u8>>();
 
     let master_read = master_fd.try_clone().expect("master fd clone failed");
-    let master_write = master_fd;
+    let master_write = master_fd.try_clone().expect("master fd clone failed");
+    let master_ui = master_fd;
+    let slave_ui = slave_fd.try_clone().expect("slave fd clone failed");
 
-    spawn_pty_threads(
-        master_read,
-        master_write,
-        tx_output.clone(),
-        rx_input,
-    );
+    spawn_pty_threads(master_read, master_write, tx_output.clone(), rx_input);
 
-    macos_ui::run_native(rx_output, tx_input, shell_pgid)?;
+    macos_ui::run_native(rx_output, tx_input, master_ui, slave_ui, shell_pgid)?;
 
     Ok(())
 }

@@ -2,13 +2,15 @@
 
 use crate::keymap;
 use crate::terminal::grid::TerminalGrid;
+use eframe::egui;
+use nix::libc::{ioctl, killpg, pid_t, tcgetpgrp, winsize, SIGWINCH, TIOCSWINSZ};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
-    NSBezierPath, NSColor, NSEvent, NSFont, NSResponder, NSStringDrawing, NSView, NSWindow,
-    NSWindowDelegate, NSWindowStyleMask,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
+    NSBackingStoreType, NSBezierPath, NSColor, NSEvent, NSFont, NSResponder, NSStringDrawing,
+    NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     ns_string, NSAttributedStringKey, NSDictionary, NSMutableDictionary, NSPoint, NSRect, NSSize,
@@ -16,6 +18,8 @@ use objc2_foundation::{
 };
 
 use std::mem;
+use std::os::fd::AsRawFd;
+use std::os::fd::OwnedFd;
 use std::sync::mpsc::{Receiver, Sender};
 use termwiz::cell::{CellAttributes, Intensity};
 use termwiz::color::{ColorAttribute, SrgbaTuple};
@@ -29,6 +33,9 @@ struct TerminalViewState {
     cell_width: f64,
     cell_height: f64,
     timer: Option<Retained<objc2_foundation::NSTimer>>,
+    master_fd: Option<OwnedFd>,
+    slave_fd: Option<OwnedFd>,
+    shell_pgid: pid_t,
 }
 
 impl Drop for TerminalViewState {
@@ -43,13 +50,16 @@ impl Drop for TerminalViewState {
 pub fn run_native(
     rx_output: Receiver<Vec<u8>>,
     tx_input: Sender<Vec<u8>>,
-    _shell_pgid: i32,
+    master_fd: OwnedFd,
+    slave_fd: OwnedFd,
+    shell_pgid: pid_t,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mtm = MainThreadMarker::new().ok_or("must be on main thread")?;
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
 
-    let delegate = ShittyAppDelegate::new(mtm, rx_output, tx_input);
+    let delegate =
+        ShittyAppDelegate::new(mtm, rx_output, tx_input, master_fd, slave_fd, shell_pgid);
     app.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*delegate)));
 
     app.run();
@@ -95,6 +105,10 @@ define_class!(
                 .unwrap_or_else(|| ShittyTerminalView::new(mtm, Self::default_terminal_state()));
 
             window.setContentView(Some(&view));
+            view.setAutoresizingMask(
+                NSAutoresizingMaskOptions::ViewWidthSizable
+                    | NSAutoresizingMaskOptions::ViewHeightSizable,
+            );
             window.makeKeyAndOrderFront(None);
             window.setAcceptsMouseMovedEvents(true);
             window.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(self)));
@@ -117,8 +131,13 @@ impl ShittyAppDelegate {
         mtm: MainThreadMarker,
         rx_output: Receiver<Vec<u8>>,
         tx_input: Sender<Vec<u8>>,
+        master_fd: OwnedFd,
+        slave_fd: OwnedFd,
+        shell_pgid: pid_t,
     ) -> Retained<Self> {
-        let view_state = Self::terminal_state_from_channels(rx_output, tx_input);
+        let view_state = Self::terminal_state_from_channels(
+            rx_output, tx_input, master_fd, slave_fd, shell_pgid,
+        );
         let this = Self::alloc(mtm).set_ivars(AppDelegateIvars::new(mtm, view_state));
         unsafe { msg_send![super(this), init] }
     }
@@ -126,8 +145,11 @@ impl ShittyAppDelegate {
     fn terminal_state_from_channels(
         rx_output: Receiver<Vec<u8>>,
         tx_input: Sender<Vec<u8>>,
+        master_fd: OwnedFd,
+        slave_fd: OwnedFd,
+        shell_pgid: pid_t,
     ) -> TerminalViewState {
-        let font = NSFont::userFixedPitchFontOfSize(14.0).unwrap();
+        let font = load_terminal_font(14.0);
         let ascender = font.ascender();
         let descender = font.descender();
         let leading = font.leading();
@@ -151,6 +173,9 @@ impl ShittyAppDelegate {
             cell_width,
             cell_height,
             timer: None,
+            master_fd: Some(master_fd),
+            slave_fd: Some(slave_fd),
+            shell_pgid,
         }
     }
 
@@ -158,8 +183,41 @@ impl ShittyAppDelegate {
         let (tx_output, rx_output) = std::sync::mpsc::channel();
         let (tx_input, _rx_input) = std::sync::mpsc::channel();
         drop(tx_output);
-        Self::terminal_state_from_channels(rx_output, tx_input)
+        let font = load_terminal_font(14.0);
+        let ascender = font.ascender();
+        let descender = font.descender();
+        let leading = font.leading();
+        let cell_height = (ascender - descender + leading).ceil();
+
+        let w_char = ns_string!("W");
+        let attrs: Retained<NSDictionary<NSAttributedStringKey, AnyObject>> = unsafe {
+            NSDictionary::dictionaryWithObject_forKey(
+                cast_any_object(&*font),
+                ProtocolObject::from_ref(objc2_app_kit::NSFontAttributeName),
+            )
+        };
+        let w_size = unsafe { w_char.sizeWithAttributes(Some(&*attrs)) };
+        let cell_width = w_size.width;
+
+        TerminalViewState {
+            grid: TerminalGrid::new(80, 24),
+            rx_output,
+            tx_input,
+            font,
+            cell_width,
+            cell_height,
+            timer: None,
+            master_fd: None,
+            slave_fd: None,
+            shell_pgid: 0,
+        }
     }
+}
+
+fn load_terminal_font(size: f64) -> Retained<NSFont> {
+    let font_name = ns_string!("MesloLGS NF");
+    NSFont::fontWithName_size(font_name, size)
+        .unwrap_or_else(|| NSFont::userFixedPitchFontOfSize(size).unwrap())
 }
 
 struct AppDelegateIvars {
@@ -193,6 +251,12 @@ define_class!(
             true
         }
 
+        #[unsafe(method(setFrameSize:))]
+        fn set_frame_size(&self, new_size: NSSize) {
+            let _: () = unsafe { msg_send![super(self), setFrameSize: new_size] };
+            self.update_grid_for_size(new_size);
+        }
+
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
             let mut input_bytes = Vec::new();
@@ -216,8 +280,13 @@ define_class!(
             let bounds = self.bounds();
             let origin = bounds.origin;
             let (cell_w, cell_h) = (state.cell_width, state.cell_height);
+            let scale = self
+                .window()
+                .map(|window| window.backingScaleFactor())
+                .unwrap_or(1.0);
 
             let default_bg = to_nscolor(state.grid.default_bg_color());
+            let default_bg_srgba = state.grid.default_bg_color();
             default_bg.set();
             NSBezierPath::fillRect(bounds);
 
@@ -233,35 +302,45 @@ define_class!(
                         ("", &CellAttributes::default(), 1)
                     };
 
-                    let (fg, bg) = resolve_cell_colors(
+                    let (fg_srgba, bg_srgba) = resolve_cell_colors(
                         attrs,
                         state.grid.default_fg_color(),
                         state.grid.default_bg_color(),
                     );
+                    let fg = to_nscolor(fg_srgba);
+                    let bg = to_nscolor(bg_srgba);
 
                     let run_text = cell_text;
 
-                    let y_pos = origin.y + bounds.size.height - ((row + 1) as f64 * cell_h);
-
-                    let text_y_pos = y_pos
-                        + (cell_h
-                            - (state.font.ascender() as f64)
-                            + (state.font.descender() as f64))
-                            / 2.0;
-
-                    let rect = NSRect::new(
-                        NSPoint::new(origin.x + col as f64 * cell_w, y_pos),
-                        NSSize::new(run_width as f64 * cell_w, cell_h),
+                    let x0 = snap_to_pixel(origin.x + col as f64 * cell_w, scale);
+                    let x1 = snap_to_pixel(
+                        origin.x + (col + run_width) as f64 * cell_w,
+                        scale,
                     );
+                    let y0 = snap_to_pixel(
+                        origin.y + bounds.size.height - ((row + 1) as f64 * cell_h),
+                        scale,
+                    );
+                    let y1 = snap_to_pixel(
+                        origin.y + bounds.size.height - (row as f64 * cell_h),
+                        scale,
+                    );
+                    let rect_w = (x1 - x0).max(0.0);
+                    let rect_h = (y1 - y0).max(0.0);
 
-                    if bg != default_bg {
+                    let font_height = state.font.ascender() as f64 - state.font.descender() as f64;
+                    let text_y_pos = y0 + (rect_h - font_height) / 2.0;
+
+                    let rect = NSRect::new(NSPoint::new(x0, y0), NSSize::new(rect_w, rect_h));
+
+                    if bg_srgba != default_bg_srgba {
                         bg.set();
                         NSBezierPath::fillRect(rect);
                     }
 
                     if !run_text.is_empty() && run_text != " " {
                         let text = NSString::from_str(run_text);
-                        let text_pos = NSPoint::new(origin.x + col as f64 * cell_w, text_y_pos);
+                        let text_pos = NSPoint::new(x0, snap_to_pixel(text_y_pos, scale));
 
                         let text_attributes: Retained<
                             NSDictionary<NSAttributedStringKey, AnyObject>,
@@ -288,6 +367,87 @@ define_class!(
                     }
 
                     col = col.saturating_add(run_width.max(1));
+                }
+            }
+
+            if state.grid.cursor_visible() {
+                let (cursor_row, cursor_col) = state.grid.cursor_pos();
+                if let Some(line) = lines.get(cursor_row) {
+                    let cell = line
+                        .get_cell(cursor_col)
+                        .map(|cell| cell.as_cell());
+                    let (cell_text, attrs) = if let Some(cell) = &cell {
+                        (cell.str(), cell.attrs())
+                    } else {
+                        (" ", &CellAttributes::default())
+                    };
+                    let (fg_srgba, bg_srgba) = resolve_cell_colors(
+                        attrs,
+                        state.grid.default_fg_color(),
+                        state.grid.default_bg_color(),
+                    );
+                    let cursor_bg_srgba = state
+                        .grid
+                        .cursor_color()
+                        .map(color32_to_srgba)
+                        .unwrap_or_else(|| {
+                            if fg_srgba == bg_srgba {
+                                SrgbaTuple(1.0, 1.0, 1.0, 1.0)
+                            } else {
+                                fg_srgba
+                            }
+                        });
+                    let cursor_fg_srgba = if cursor_bg_srgba == bg_srgba {
+                        fg_srgba
+                    } else {
+                        bg_srgba
+                    };
+                    let cursor_x0 = snap_to_pixel(origin.x + cursor_col as f64 * cell_w, scale);
+                    let cursor_x1 =
+                        snap_to_pixel(origin.x + (cursor_col + 1) as f64 * cell_w, scale);
+                    let cursor_y0 = snap_to_pixel(
+                        origin.y + bounds.size.height - ((cursor_row + 1) as f64 * cell_h),
+                        scale,
+                    );
+                    let cursor_y1 =
+                        snap_to_pixel(origin.y + bounds.size.height - (cursor_row as f64 * cell_h), scale);
+                    let cursor_rect = NSRect::new(
+                        NSPoint::new(cursor_x0, cursor_y0),
+                        NSSize::new(
+                            (cursor_x1 - cursor_x0).max(0.0),
+                            (cursor_y1 - cursor_y0).max(0.0),
+                        ),
+                    );
+                    let cursor_bg = to_nscolor(cursor_bg_srgba);
+                    let cursor_fg = to_nscolor(cursor_fg_srgba);
+                    cursor_bg.set();
+                    NSBezierPath::fillRect(cursor_rect);
+
+                    let cursor_rect_h = (cursor_y1 - cursor_y0).max(0.0);
+                    let font_height = state.font.ascender() as f64 - state.font.descender() as f64;
+                    let text_pos = NSPoint::new(
+                        cursor_x0,
+                        snap_to_pixel(cursor_y0 + (cursor_rect_h - font_height) / 2.0, scale),
+                    );
+                    let text = NSString::from_str(cell_text);
+                    let text_attributes: Retained<NSDictionary<NSAttributedStringKey, AnyObject>> =
+                        unsafe {
+                            NSDictionary::dictionaryWithObject_forKey(
+                                unsafe { cast_any_object(&*cursor_fg) },
+                                ProtocolObject::from_ref(
+                                    objc2_app_kit::NSForegroundColorAttributeName,
+                                ),
+                            )
+                        };
+                    let text_attributes =
+                        unsafe { NSMutableDictionary::dictionaryWithDictionary(&text_attributes) };
+                    unsafe {
+                        text_attributes.setObject_forKey(
+                            unsafe { cast_any_object(&*state.font) },
+                            ProtocolObject::from_ref(objc2_app_kit::NSFontAttributeName),
+                        )
+                    };
+                    unsafe { text.drawAtPoint_withAttributes(text_pos, Some(&text_attributes)) };
                 }
             }
         }
@@ -319,7 +479,36 @@ impl ShittyTerminalView {
                 state.timer = Some(timer);
             }
         }
+        view.update_grid_for_size(view.bounds().size);
         view
+    }
+
+    fn update_grid_for_size(&self, size: NSSize) {
+        let state_ptr = self.ivars().state;
+        if state_ptr.is_null() {
+            return;
+        }
+        let state = unsafe { &mut *state_ptr };
+        let cols = (size.width / state.cell_width).floor() as usize;
+        let rows = (size.height / state.cell_height).floor() as usize;
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        if !state.grid.resize(cols, rows) {
+            return;
+        }
+        if let Some(master_fd) = state.master_fd.as_ref() {
+            set_winsize_raw(master_fd.as_raw_fd(), cols as u16, rows as u16);
+        }
+        if let Some(slave_fd) = state.slave_fd.as_ref() {
+            let pgid = unsafe { tcgetpgrp(slave_fd.as_raw_fd()) };
+            let target_pgid = if pgid > 0 { pgid } else { state.shell_pgid };
+            if target_pgid > 0 {
+                unsafe {
+                    let _ = killpg(target_pgid, SIGWINCH);
+                }
+            }
+        }
+        self.setNeedsDisplay(true);
     }
 }
 
@@ -371,6 +560,18 @@ fn cast_any_object<T: ?Sized>(obj: &T) -> &AnyObject {
     unsafe { &*(obj as *const T as *const AnyObject) }
 }
 
+fn set_winsize_raw(fd: i32, cols: u16, rows: u16) {
+    let ws = winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    unsafe {
+        let _ = ioctl(fd, TIOCSWINSZ, &ws);
+    }
+}
+
 // Helper to convert termwiz colors to NSColor.
 fn to_nscolor(c: SrgbaTuple) -> Retained<NSColor> {
     let (r, g, b, a) = c.to_srgb_u8();
@@ -387,7 +588,7 @@ fn resolve_cell_colors(
     attrs: &CellAttributes,
     default_fg: SrgbaTuple,
     default_bg: SrgbaTuple,
-) -> (Retained<NSColor>, Retained<NSColor>) {
+) -> (SrgbaTuple, SrgbaTuple) {
     let mut final_fg = match attrs.foreground() {
         ColorAttribute::Default => default_fg,
         ColorAttribute::PaletteIndex(i) => ansi_palette_color(i),
@@ -412,30 +613,64 @@ fn resolve_cell_colors(
         mem::swap(&mut final_fg, &mut final_bg);
     }
 
-    (to_nscolor(final_fg), to_nscolor(final_bg))
+    (final_fg, final_bg)
+}
+
+fn color32_to_srgba(color: egui::Color32) -> SrgbaTuple {
+    let r = color.r() as f32 / 255.0;
+    let g = color.g() as f32 / 255.0;
+    let b = color.b() as f32 / 255.0;
+    let a = color.a() as f32 / 255.0;
+    SrgbaTuple(r, g, b, a)
+}
+
+fn snap_to_pixel(value: f64, scale: f64) -> f64 {
+    if scale <= 0.0 {
+        return value;
+    }
+    (value * scale).round() / scale
 }
 
 fn ansi_palette_color(index: u8) -> SrgbaTuple {
-    let idx = index as usize;
-    let clamped = if idx < ANSI_PALETTE.len() { idx } else { 0 };
-    ANSI_PALETTE[clamped]
+    if index < 16 {
+        return ansi_16_srgba(index);
+    }
+    if index < 232 {
+        let idx = index - 16;
+        let r = idx / 36;
+        let g = (idx / 6) % 6;
+        let b = idx % 6;
+        return SrgbaTuple(
+            RGB_LEVELS[r as usize] as f32 / 255.0,
+            RGB_LEVELS[g as usize] as f32 / 255.0,
+            RGB_LEVELS[b as usize] as f32 / 255.0,
+            1.0,
+        );
+    }
+    let gray = 8u8.saturating_add((index - 232).saturating_mul(10));
+    let channel = gray as f32 / 255.0;
+    SrgbaTuple(channel, channel, channel, 1.0)
 }
 
-const ANSI_PALETTE: [SrgbaTuple; 16] = [
-    SrgbaTuple(0.0, 0.0, 0.0, 1.0),
-    SrgbaTuple(0.5, 0.0, 0.0, 1.0),
-    SrgbaTuple(0.0, 0.5, 0.0, 1.0),
-    SrgbaTuple(0.5, 0.5, 0.0, 1.0),
-    SrgbaTuple(0.0, 0.0, 0.5, 1.0),
-    SrgbaTuple(0.5, 0.0, 0.5, 1.0),
-    SrgbaTuple(0.0, 0.5, 0.5, 1.0),
-    SrgbaTuple(0.75, 0.75, 0.75, 1.0),
-    SrgbaTuple(0.5, 0.5, 0.5, 1.0),
-    SrgbaTuple(1.0, 0.0, 0.0, 1.0),
-    SrgbaTuple(0.0, 1.0, 0.0, 1.0),
-    SrgbaTuple(1.0, 1.0, 0.0, 1.0),
-    SrgbaTuple(0.0, 0.0, 1.0, 1.0),
-    SrgbaTuple(1.0, 0.0, 1.0, 1.0),
-    SrgbaTuple(0.0, 1.0, 1.0, 1.0),
-    SrgbaTuple(1.0, 1.0, 1.0, 1.0),
-];
+fn ansi_16_srgba(index: u8) -> SrgbaTuple {
+    match index {
+        0 => SrgbaTuple(0.0, 0.0, 0.0, 1.0),
+        1 => SrgbaTuple(0.5, 0.0, 0.0, 1.0),
+        2 => SrgbaTuple(0.0, 0.5, 0.0, 1.0),
+        3 => SrgbaTuple(0.5, 0.5, 0.0, 1.0),
+        4 => SrgbaTuple(0.0, 0.0, 0.5, 1.0),
+        5 => SrgbaTuple(0.5, 0.0, 0.5, 1.0),
+        6 => SrgbaTuple(0.0, 0.5, 0.5, 1.0),
+        7 => SrgbaTuple(0.75, 0.75, 0.75, 1.0),
+        8 => SrgbaTuple(0.5, 0.5, 0.5, 1.0),
+        9 => SrgbaTuple(1.0, 0.0, 0.0, 1.0),
+        10 => SrgbaTuple(0.0, 1.0, 0.0, 1.0),
+        11 => SrgbaTuple(1.0, 1.0, 0.0, 1.0),
+        12 => SrgbaTuple(0.0, 0.0, 1.0, 1.0),
+        13 => SrgbaTuple(1.0, 0.0, 1.0, 1.0),
+        14 => SrgbaTuple(0.0, 1.0, 1.0, 1.0),
+        _ => SrgbaTuple(1.0, 1.0, 1.0, 1.0),
+    }
+}
+
+const RGB_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
