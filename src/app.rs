@@ -12,6 +12,7 @@ use std::sync::mpsc::channel;
 use std::sync::Arc;
 use std::thread;
 
+use crate::pty::{apply_resize, PtyEvent};
 use crate::ui::TerminalUI;
 
 pub fn run() -> eframe::Result<()> {
@@ -51,18 +52,16 @@ pub fn run() -> eframe::Result<()> {
             configure_fonts(cc);
 
             let (tx_output, rx_output) = channel::<Vec<u8>>();
-            let (tx_input, rx_input) = channel::<Vec<u8>>();
+            let (tx_input, rx_input) = channel::<PtyEvent>();
             let ctx = cc.egui_ctx.clone();
 
-            let master_ui = master_fd.try_clone().expect("master fd clone failed");
-            let slave_ui = slave_fd.try_clone().expect("slave fd clone failed");
             let master_read = master_fd.try_clone().expect("master fd clone failed");
             let master_write = master_fd;
 
-            spawn_pty_threads(master_read, master_write, tx_output, rx_input, ctx);
+            spawn_pty_threads(master_read, master_write, tx_output, rx_input, ctx, shell_pgid);
 
             Ok(Box::new(TerminalUI::new(
-                rx_output, tx_input, master_ui, slave_ui, shell_pgid,
+                rx_output, tx_input,
             )))
         }),
     )
@@ -95,7 +94,7 @@ fn configure_fonts(cc: &eframe::CreationContext<'_>) {
 fn spawn_shell(slave_fd: &OwnedFd) -> i32 {
     unsafe {
         let ctty_fd = slave_fd.try_clone().expect("slave fd clone failed");
-        let child = Command::new("/bin/zsh")
+        let mut child = Command::new("/bin/zsh")
             .stdin(slave_fd.try_clone().expect("slave fd clone failed"))
             .stdout(slave_fd.try_clone().expect("slave fd clone failed"))
             .stderr(slave_fd.try_clone().expect("slave fd clone failed"))
@@ -106,7 +105,11 @@ fn spawn_shell(slave_fd: &OwnedFd) -> i32 {
             })
             .spawn()
             .expect("Failed to spawn shell");
-        child.id() as i32
+        let pid = child.id() as i32;
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
+        pid
     }
 }
 
@@ -114,9 +117,11 @@ fn spawn_pty_threads(
     master_read: OwnedFd,
     master_write: OwnedFd,
     tx_output: std::sync::mpsc::Sender<Vec<u8>>,
-    rx_input: std::sync::mpsc::Receiver<Vec<u8>>,
+    rx_input: std::sync::mpsc::Receiver<PtyEvent>,
     ctx: egui::Context,
+    shell_pgid: i32,
 ) {
+    // Pty receive thread
     thread::spawn(move || loop {
         // Increased buffer size from 2048 to 8192 for better throughput
         let mut buffer = [0u8; 8192];
@@ -132,10 +137,18 @@ fn spawn_pty_threads(
         }
     });
 
+    // Pty send thread
     thread::spawn(move || {
-        while let Ok(bytes) = rx_input.recv() {
-            if write(master_write.as_fd(), &bytes).is_err() {
-                break;
+        while let Ok(event) = rx_input.recv() {
+            match event {
+                PtyEvent::Input(bytes) => {
+                    if write(master_write.as_fd(), &bytes).is_err() {
+                        break;
+                    }
+                }
+                PtyEvent::Resize { cols, rows } => {
+                    apply_resize(master_write.as_raw_fd(), cols, rows, shell_pgid);
+                }
             }
         }
     });

@@ -1,39 +1,29 @@
 use eframe::egui::{self};
-use nix::libc::{ioctl, killpg, pid_t, tcgetpgrp, winsize, SIGWINCH, TIOCSWINSZ};
-use std::os::fd::AsRawFd;
 use std::sync::mpsc::{Receiver, Sender};
 
 use crate::keymap::append_input_from_event;
+use crate::pty::PtyEvent;
 use crate::terminal::TerminalGrid;
 
 pub(crate) struct TerminalUI {
-    rx: Receiver<Vec<u8>>,
-    tx_input: Sender<Vec<u8>>,
+    rx_output: Receiver<Vec<u8>>,
+    tx_input: Sender<PtyEvent>,
     grid: TerminalGrid,
     font_id: egui::FontId,
-    master_fd: std::os::fd::OwnedFd,
-    slave_fd: std::os::fd::OwnedFd,
-    shell_pgid: pid_t,
     // Cache cell size to avoid recalculating every frame
     cached_cell_size: Option<(f32, f32)>,
 }
 
 impl TerminalUI {
     pub(crate) fn new(
-        rx: Receiver<Vec<u8>>,
-        tx_input: Sender<Vec<u8>>,
-        master_fd: std::os::fd::OwnedFd,
-        slave_fd: std::os::fd::OwnedFd,
-        shell_pgid: pid_t,
+        rx_output: Receiver<Vec<u8>>,
+        tx_input: Sender<PtyEvent>,
     ) -> Self {
         Self {
-            rx,
+            rx_output,
             tx_input,
             grid: TerminalGrid::new(80, 24),
             font_id: egui::FontId::monospace(14.0),
-            master_fd,
-            slave_fd,
-            shell_pgid,
             cached_cell_size: None,
         }
     }
@@ -66,18 +56,6 @@ fn grid_to_screen(
     )
 }
 
-fn set_winsize_raw(fd: i32, cols: u16, rows: u16) {
-    let ws = winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    unsafe {
-        let _ = ioctl(fd, TIOCSWINSZ, &ws);
-    }
-}
-
 impl eframe::App for TerminalUI {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Track if we need to request a repaint
@@ -95,18 +73,16 @@ impl eframe::App for TerminalUI {
 
                 // Check for resize
                 if self.grid.resize(cols, rows) {
-                    set_winsize_raw(self.master_fd.as_raw_fd(), cols as u16, rows as u16);
-                    let pgid = unsafe { tcgetpgrp(self.slave_fd.as_raw_fd()) };
-                    let target_pgid = if pgid > 0 { pgid } else { self.shell_pgid };
-                    unsafe {
-                        let _ = killpg(target_pgid, SIGWINCH);
-                    }
+                    let _ = self.tx_input.send(PtyEvent::Resize {
+                        cols: cols as u16,
+                        rows: rows as u16,
+                    });
                     needs_repaint = true;
                 }
 
                 // Process incoming data from PTY
                 let mut received_data = false;
-                while let Ok(bytes) = self.rx.try_recv() {
+                while let Ok(bytes) = self.rx_output.try_recv() {
                     self.grid.write_bytes(&bytes);
                     received_data = true;
                 }
@@ -129,7 +105,7 @@ impl eframe::App for TerminalUI {
                     }
                 });
                 if !input_bytes.is_empty() {
-                    let _ = self.tx_input.send(input_bytes);
+                    let _ = self.tx_input.send(PtyEvent::Input(input_bytes));
                 }
 
                 let painter = ui.painter_at(rect);
@@ -164,15 +140,13 @@ impl eframe::App for TerminalUI {
                             painter.text(pos, egui::Align2::LEFT_TOP, text, font_id.clone(), fg);
                         }
 
-                        if let Some(cell) = &cell {
-                            if self.grid.cell_underline(cell) {
-                                let y = pos.y + cell_h - 1.0;
-                                let rect = egui::Rect::from_min_size(
-                                    egui::pos2(pos.x, y),
-                                    egui::vec2(cell_w, 1.0),
-                                );
-                                painter.rect_filled(rect, 0.0, fg);
-                            }
+                        if let Some(cell) = &cell && self.grid.cell_underline(cell) {
+                            let y = pos.y + cell_h - 1.0;
+                            let rect = egui::Rect::from_min_size(
+                                egui::pos2(pos.x, y),
+                                egui::vec2(cell_w, 1.0),
+                            );
+                            painter.rect_filled(rect, 0.0, fg);
                         }
                     }
                 }

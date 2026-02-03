@@ -1,5 +1,6 @@
 mod app;
 mod keymap;
+mod pty;
 mod terminal;
 mod ui;
 
