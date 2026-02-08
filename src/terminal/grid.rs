@@ -1,6 +1,6 @@
 use eframe::egui;
 
-use crate::terminal::color::{xterm_256_color, DEFAULT_BG, DEFAULT_FG};
+use crate::terminal::color::{DEFAULT_BG, DEFAULT_FG, xterm_256_color};
 
 pub(crate) struct TerminalGrid {
     parser: vt100::Parser,
@@ -65,7 +65,7 @@ impl TerminalGrid {
         true
     }
 
-    pub(crate) fn write_bytes(&mut self, bytes: &[u8]) {
+    pub(crate) fn process_pty_bytes(&mut self, bytes: &[u8]) {
         self.parser.process(bytes);
         self.has_changes = true;
     }

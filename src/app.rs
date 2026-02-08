@@ -1,18 +1,18 @@
 use eframe::egui;
 use egui::IconData;
 use image::GenericImageView;
-use nix::libc::{ioctl, setsid, TIOCSCTTY};
+use nix::libc::{TIOCSCTTY, ioctl, setsid};
 use nix::pty::openpty;
 use nix::unistd::{read, write};
 use std::fs;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
-use std::sync::mpsc::channel;
 use std::sync::Arc;
+use std::sync::mpsc::channel;
 use std::thread;
 
-use crate::pty::{apply_resize, PtyEvent};
+use crate::pty::{PtyEvent, apply_resize};
 use crate::ui::TerminalUI;
 
 pub fn run() -> eframe::Result<()> {
@@ -51,18 +51,23 @@ pub fn run() -> eframe::Result<()> {
             configure_visuals(cc);
             configure_fonts(cc);
 
-            let (tx_output, rx_output) = channel::<Vec<u8>>();
-            let (tx_input, rx_input) = channel::<PtyEvent>();
+            let (tx_pty_output, rx_pty_output) = channel::<Vec<u8>>();
+            let (tx_pty_input, rx_pty_input) = channel::<PtyEvent>();
             let ctx = cc.egui_ctx.clone();
 
             let master_read = master_fd.try_clone().expect("master fd clone failed");
             let master_write = master_fd;
 
-            spawn_pty_threads(master_read, master_write, tx_output, rx_input, ctx, shell_pgid);
+            spawn_pty_threads(
+                master_read,
+                master_write,
+                tx_pty_output,
+                rx_pty_input,
+                ctx,
+                shell_pgid,
+            );
 
-            Ok(Box::new(TerminalUI::new(
-                rx_output, tx_input,
-            )))
+            Ok(Box::new(TerminalUI::new(rx_pty_output, tx_pty_input)))
         }),
     )
 }
@@ -116,30 +121,32 @@ fn spawn_shell(slave_fd: &OwnedFd) -> i32 {
 fn spawn_pty_threads(
     master_read: OwnedFd,
     master_write: OwnedFd,
-    tx_output: std::sync::mpsc::Sender<Vec<u8>>,
-    rx_input: std::sync::mpsc::Receiver<PtyEvent>,
+    tx_pty_output: std::sync::mpsc::Sender<Vec<u8>>,
+    rx_pty_input: std::sync::mpsc::Receiver<PtyEvent>,
     ctx: egui::Context,
     shell_pgid: i32,
 ) {
     // Pty receive thread
-    thread::spawn(move || loop {
-        // Increased buffer size from 2048 to 8192 for better throughput
-        let mut buffer = [0u8; 8192];
-        match read(master_read.as_fd(), &mut buffer) {
-            Ok(0) => break,
-            Ok(n) => {
-                if tx_output.send(buffer[..n].to_vec()).is_err() {
-                    break;
+    thread::spawn(move || {
+        loop {
+            // Increased buffer size from 2048 to 8192 for better throughput
+            let mut buffer = [0u8; 8192];
+            match read(master_read.as_fd(), &mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx_pty_output.send(buffer[..n].to_vec()).is_err() {
+                        break;
+                    }
+                    ctx.request_repaint();
                 }
-                ctx.request_repaint();
+                Err(_) => break,
             }
-            Err(_) => break,
         }
     });
 
     // Pty send thread
     thread::spawn(move || {
-        while let Ok(event) = rx_input.recv() {
+        while let Ok(event) = rx_pty_input.recv() {
             match event {
                 PtyEvent::Input(bytes) => {
                     if write(master_write.as_fd(), &bytes).is_err() {

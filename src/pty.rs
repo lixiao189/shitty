@@ -1,4 +1,4 @@
-use nix::libc::{ioctl, killpg, pid_t, tcgetpgrp, winsize, SIGWINCH, TIOCSWINSZ};
+use nix::libc::{SIGWINCH, TIOCSWINSZ, ioctl, killpg, pid_t, tcgetpgrp, winsize};
 
 pub(crate) enum PtyEvent {
     Input(Vec<u8>),

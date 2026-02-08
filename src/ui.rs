@@ -6,8 +6,8 @@ use crate::pty::PtyEvent;
 use crate::terminal::TerminalGrid;
 
 pub(crate) struct TerminalUI {
-    rx_output: Receiver<Vec<u8>>,
-    tx_input: Sender<PtyEvent>,
+    rx_pty_output: Receiver<Vec<u8>>,
+    tx_pty_input: Sender<PtyEvent>,
     grid: TerminalGrid,
     font_id: egui::FontId,
     // Cache cell size to avoid recalculating every frame
@@ -15,13 +15,10 @@ pub(crate) struct TerminalUI {
 }
 
 impl TerminalUI {
-    pub(crate) fn new(
-        rx_output: Receiver<Vec<u8>>,
-        tx_input: Sender<PtyEvent>,
-    ) -> Self {
+    pub(crate) fn new(rx_pty_output: Receiver<Vec<u8>>, tx_pty_input: Sender<PtyEvent>) -> Self {
         Self {
-            rx_output,
-            tx_input,
+            rx_pty_output,
+            tx_pty_input,
             grid: TerminalGrid::new(80, 24),
             font_id: egui::FontId::monospace(14.0),
             cached_cell_size: None,
@@ -66,14 +63,12 @@ impl eframe::App for TerminalUI {
             .show(ctx, |ui| {
                 let (cell_w, cell_h) = self.cell_size(ctx);
                 let available = ui.available_size();
-                let cols = (available.x / cell_w).floor() as usize;
-                let rows = (available.y / cell_h).floor() as usize;
-                let cols = cols.max(1);
-                let rows = rows.max(1);
+                let cols = ((available.x / cell_w).floor() as usize).max(1);
+                let rows = ((available.y / cell_h).floor() as usize).max(1);
 
                 // Check for resize
                 if self.grid.resize(cols, rows) {
-                    let _ = self.tx_input.send(PtyEvent::Resize {
+                    let _ = self.tx_pty_input.send(PtyEvent::Resize {
                         cols: cols as u16,
                         rows: rows as u16,
                     });
@@ -82,8 +77,8 @@ impl eframe::App for TerminalUI {
 
                 // Process incoming data from PTY
                 let mut received_data = false;
-                while let Ok(bytes) = self.rx_output.try_recv() {
-                    self.grid.write_bytes(&bytes);
+                while let Ok(bytes) = self.rx_pty_output.try_recv() {
+                    self.grid.process_pty_bytes(&bytes);
                     received_data = true;
                 }
 
@@ -92,10 +87,7 @@ impl eframe::App for TerminalUI {
                     needs_repaint = true;
                 }
 
-                let (rect, response) = ui.allocate_at_least(available, egui::Sense::click());
-                if response.clicked() {
-                    ui.memory_mut(|memory| memory.request_focus(response.id));
-                }
+                let (rect, _response) = ui.allocate_at_least(available, egui::Sense::click());
 
                 let mut input_bytes = Vec::new();
                 ctx.input(|input| {
@@ -105,7 +97,7 @@ impl eframe::App for TerminalUI {
                     }
                 });
                 if !input_bytes.is_empty() {
-                    let _ = self.tx_input.send(PtyEvent::Input(input_bytes));
+                    let _ = self.tx_pty_input.send(PtyEvent::Input(input_bytes));
                 }
 
                 let painter = ui.painter_at(rect);
@@ -140,7 +132,9 @@ impl eframe::App for TerminalUI {
                             painter.text(pos, egui::Align2::LEFT_TOP, text, font_id.clone(), fg);
                         }
 
-                        if let Some(cell) = &cell && self.grid.cell_underline(cell) {
+                        if let Some(cell) = &cell
+                            && self.grid.cell_underline(cell)
+                        {
                             let y = pos.y + cell_h - 1.0;
                             let rect = egui::Rect::from_min_size(
                                 egui::pos2(pos.x, y),
