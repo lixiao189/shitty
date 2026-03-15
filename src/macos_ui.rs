@@ -1,5 +1,4 @@
-#![cfg(target_os = "macos")]
-
+#[cfg(target_os = "macos")]
 use crate::keymap;
 use crate::terminal::grid::TerminalGrid;
 use eframe::egui;
@@ -290,15 +289,16 @@ define_class!(
             let cols = state.grid.cols();
 
             for row in 0..rows {
-                let mut col = 0;
+                let mut col: usize = 0;
                 while col < cols {
                     let cell = state.grid.get_cell(row, col);
                     let (cell_text, fg, bg, underline, run_width, skip_cell) =
                         if let Some(cell) = &cell {
+                            let (fg, bg) = state.grid.resolve_cell_colors(cell);
                             (
                                 cell.text.as_str(),
-                                cell.fg,
-                                cell.bg,
+                                fg,
+                                bg,
                                 cell.underline,
                                 if cell.wide { 2 } else { 1 },
                                 cell.wide_continuation,
@@ -328,7 +328,7 @@ define_class!(
                     let rect_w = (x1 - x0).max(0.0);
                     let rect_h = (y1 - y0).max(0.0);
 
-                    let font_height = state.font.ascender() as f64 - state.font.descender() as f64;
+                    let font_height = state.font.ascender() - state.font.descender();
                     let text_y_pos = y0 + (rect_h - font_height) / 2.0;
 
                     let rect = NSRect::new(NSPoint::new(x0, y0), NSSize::new(rect_w, rect_h));
@@ -424,7 +424,7 @@ define_class!(
                 NSBezierPath::fillRect(cursor_rect);
 
                 let cursor_rect_h = (cursor_y1 - cursor_y0).max(0.0);
-                let font_height = state.font.ascender() as f64 - state.font.descender() as f64;
+                let font_height = state.font.ascender() - state.font.descender();
                 let text_pos = NSPoint::new(
                     cursor_x0,
                     snap_to_pixel(cursor_y0 + (cursor_rect_h - font_height) / 2.0, scale),
@@ -467,14 +467,14 @@ impl ShittyTerminalView {
         let timer = unsafe {
             objc2_foundation::NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
                 1.0 / 60.0,
-                &*timer_target,
+                &timer_target,
                 sel!(onTimerTick:),
                 None,
                 true,
             )
         };
         unsafe {
-            if let Some(state) = (state_ptr as *mut TerminalViewState).as_mut() {
+            if let Some(state) = state_ptr.as_mut() {
                 state.timer = Some(timer);
             }
         }
@@ -514,6 +514,19 @@ impl ShittyTerminalView {
 struct TerminalViewIvars {
     state: *mut TerminalViewState,
 }
+
+// Drop impl ensures the boxed TerminalViewState is freed when the ObjC view
+// is deallocated by ARC, which also triggers TerminalViewState::drop() which
+// invalidates the NSTimer and breaks the retain cycle.
+impl Drop for TerminalViewIvars {
+    fn drop(&mut self) {
+        if !self.state.is_null() {
+            unsafe { drop(Box::from_raw(self.state)) };
+            self.state = std::ptr::null_mut();
+        }
+    }
+}
+
 
 define_class!(
     #[unsafe(super(objc2_foundation::NSObject))]

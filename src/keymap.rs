@@ -152,13 +152,12 @@ pub mod macos_keymap {
         let chars = event.characters().unwrap();
         let chars_str = autoreleasepool(|pool| unsafe { chars.to_str(pool).to_string() });
 
-        if modifiers.contains(NSEventModifierFlags::Control) {
-            if let Some(first_char) = chars_str.chars().next() {
-                if first_char.is_ascii_alphabetic() {
-                    out.push(first_char.to_ascii_uppercase() as u8 - b'A' + 1);
-                    return;
-                }
-            }
+        if modifiers.contains(NSEventModifierFlags::Control)
+            && let Some(first_char) = chars_str.chars().next()
+            && first_char.is_ascii_alphabetic()
+        {
+            out.push(first_char.to_ascii_uppercase() as u8 - b'A' + 1);
+            return;
         }
 
         if !chars_str.is_empty() {

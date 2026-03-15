@@ -112,17 +112,29 @@ impl eframe::App for TerminalUI {
 
                 // Render all cells
                 for row in 0..rows {
-                    for col in 0..cols {
+                    let mut col = 0;
+                    while col < cols {
                         let cell = self.grid.get_cell(row, col);
-                        let (text, fg, bg) = if let Some(cell) = &cell {
+
+                        // Skip wide-character continuation cells (already drawn by the leading cell)
+                        if cell.as_ref().is_some_and(|c| c.wide_continuation) {
+                            col += 1;
+                            continue;
+                        }
+
+                        let (text, fg, bg, underline, col_span) = if let Some(cell) = &cell {
                             let (fg, bg) = self.grid.resolve_cell_colors(cell);
-                            (cell.text.as_str(), fg, bg)
+                            let span = if cell.wide { 2 } else { 1 };
+                            (cell.text.as_str(), fg, bg, cell.underline, span)
                         } else {
-                            ("", egui::Color32::WHITE, default_bg)
+                            ("", egui::Color32::WHITE, default_bg, false, 1)
                         };
 
                         let pos = grid_to_screen(origin, cell_w, cell_h, row, col);
-                        let rect = egui::Rect::from_min_size(pos, egui::vec2(cell_w, cell_h));
+                        let rect = egui::Rect::from_min_size(
+                            pos,
+                            egui::vec2(cell_w * col_span as f32, cell_h),
+                        );
 
                         if bg != default_bg {
                             painter.rect_filled(rect, 0.0, bg);
@@ -132,16 +144,16 @@ impl eframe::App for TerminalUI {
                             painter.text(pos, egui::Align2::LEFT_TOP, text, font_id.clone(), fg);
                         }
 
-                        if let Some(cell) = &cell {
-                            if cell.underline {
-                                let y = pos.y + cell_h - 1.0;
-                                let rect = egui::Rect::from_min_size(
-                                    egui::pos2(pos.x, y),
-                                    egui::vec2(cell_w, 1.0),
-                                );
-                                painter.rect_filled(rect, 0.0, fg);
-                            }
+                        if underline {
+                            let y = pos.y + cell_h - 1.0;
+                            let underline_rect = egui::Rect::from_min_size(
+                                egui::pos2(pos.x, y),
+                                egui::vec2(cell_w * col_span as f32, 1.0),
+                            );
+                            painter.rect_filled(underline_rect, 0.0, fg);
                         }
+
+                        col += col_span;
                     }
                 }
 
