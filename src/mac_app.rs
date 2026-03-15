@@ -1,8 +1,10 @@
-#[cfg(target_os = "macos")]
 use crate::keymap;
 use crate::terminal::grid::TerminalGrid;
 use eframe::egui;
-use nix::libc::{ioctl, killpg, pid_t, tcgetpgrp, winsize, SIGWINCH, TIOCSWINSZ};
+use nix::libc::{ioctl, killpg, pid_t, setsid, tcgetpgrp, winsize, SIGWINCH, TIOCSCTTY,
+                TIOCSWINSZ};
+use nix::pty::openpty;
+use nix::unistd::{read, write};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
@@ -15,10 +17,99 @@ use objc2_foundation::{
     ns_string, NSAttributedStringKey, NSDictionary, NSMutableDictionary, NSPoint, NSRect, NSSize,
     NSString,
 };
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
+use std::process::Command;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::thread;
 
-use std::os::fd::AsRawFd;
-use std::os::fd::OwnedFd;
-use std::sync::mpsc::{Receiver, Sender};
+pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let pty_result = openpty(None, None)?;
+    let master_fd = pty_result.master;
+    let slave_fd = pty_result.slave;
+    let shell_pgid = spawn_shell(&slave_fd);
+
+    let (tx_pty_output, rx_pty_output) = channel::<Vec<u8>>();
+    let (tx_pty_input, rx_pty_input) = channel::<Vec<u8>>();
+
+    let master_read = master_fd.try_clone().expect("master fd clone failed");
+    let master_write = master_fd.try_clone().expect("master fd clone failed");
+    let master_ui = master_fd;
+    let slave_ui = slave_fd.try_clone().expect("slave fd clone failed");
+
+    spawn_pty_threads(master_read, master_write, tx_pty_output, rx_pty_input);
+
+    let mtm = MainThreadMarker::new().ok_or("must be on main thread")?;
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+
+    let delegate = ShittyAppDelegate::new(
+        mtm,
+        rx_pty_output,
+        tx_pty_input,
+        master_ui,
+        slave_ui,
+        shell_pgid,
+    );
+    app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+
+    app.run();
+    Ok(())
+}
+
+fn spawn_shell(slave_fd: &OwnedFd) -> i32 {
+    unsafe {
+        let ctty_fd = slave_fd.try_clone().expect("slave fd clone failed");
+        let mut child = Command::new("/bin/zsh")
+            .stdin(slave_fd.try_clone().expect("slave fd clone failed"))
+            .stdout(slave_fd.try_clone().expect("slave fd clone failed"))
+            .stderr(slave_fd.try_clone().expect("slave fd clone failed"))
+            .pre_exec(move || {
+                let _ = setsid();
+                let _ = ioctl(ctty_fd.as_raw_fd(), TIOCSCTTY as _, 0);
+                Ok(())
+            })
+            .spawn()
+            .expect("Failed to spawn shell");
+        let pid = child.id() as i32;
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
+        pid
+    }
+}
+
+// No PtyEvent on the macOS path — AppKit timer drives rendering and resize is
+// handled directly in the view's setFrameSize handler.
+fn spawn_pty_threads(
+    master_read: OwnedFd,
+    master_write: OwnedFd,
+    tx_pty_output: Sender<Vec<u8>>,
+    rx_pty_input: Receiver<Vec<u8>>,
+) {
+    thread::spawn(move || loop {
+        let mut buffer = [0u8; 8192];
+        match read(master_read.as_fd(), &mut buffer) {
+            Ok(0) => break,
+            Ok(n) => {
+                if tx_pty_output.send(buffer[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    });
+
+    thread::spawn(move || {
+        while let Ok(bytes) = rx_pty_input.recv() {
+            if write(master_write.as_fd(), &bytes).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+// --- AppKit UI -----------------------------------------------------------
 
 /// Holds the Rust-side state for our terminal view.
 struct TerminalViewState {
@@ -40,26 +131,6 @@ impl Drop for TerminalViewState {
             timer.invalidate();
         }
     }
-}
-
-// Main entry point for the native macOS application.
-pub fn run_native(
-    rx_output: Receiver<Vec<u8>>,
-    tx_input: Sender<Vec<u8>>,
-    master_fd: OwnedFd,
-    slave_fd: OwnedFd,
-    shell_pgid: pid_t,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mtm = MainThreadMarker::new().ok_or("must be on main thread")?;
-    let app = NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
-
-    let delegate =
-        ShittyAppDelegate::new(mtm, rx_output, tx_input, master_fd, slave_fd, shell_pgid);
-    app.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*delegate)));
-
-    app.run();
-    Ok(())
 }
 
 define_class!(
@@ -107,7 +178,7 @@ define_class!(
             );
             window.makeKeyAndOrderFront(None);
             window.setAcceptsMouseMovedEvents(true);
-            window.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(self)));
+            window.setDelegate(Some(ProtocolObject::from_ref(self)));
 
             self.ivars().window.replace(Some(window));
             self.ivars().terminal_view.replace(Some(view));
@@ -131,9 +202,8 @@ impl ShittyAppDelegate {
         slave_fd: OwnedFd,
         shell_pgid: pid_t,
     ) -> Retained<Self> {
-        let view_state = Self::terminal_state_from_channels(
-            rx_output, tx_input, master_fd, slave_fd, shell_pgid,
-        );
+        let view_state =
+            Self::terminal_state_from_channels(rx_output, tx_input, master_fd, slave_fd, shell_pgid);
         let this = Self::alloc(mtm).set_ivars(AppDelegateIvars::new(mtm, view_state));
         unsafe { msg_send![super(this), init] }
     }
@@ -146,20 +216,7 @@ impl ShittyAppDelegate {
         shell_pgid: pid_t,
     ) -> TerminalViewState {
         let font = load_terminal_font(14.0);
-        let ascender = font.ascender();
-        let descender = font.descender();
-        let leading = font.leading();
-        let cell_height = (ascender - descender + leading).ceil();
-
-        let w_char = ns_string!("W");
-        let attrs: Retained<NSDictionary<NSAttributedStringKey, AnyObject>> = unsafe {
-            NSDictionary::dictionaryWithObject_forKey(
-                cast_any_object(&*font),
-                ProtocolObject::from_ref(objc2_app_kit::NSFontAttributeName),
-            )
-        };
-        let w_size = unsafe { w_char.sizeWithAttributes(Some(&*attrs)) };
-        let cell_width = w_size.width;
+        let (cell_width, cell_height) = measure_cell_size(&font);
 
         TerminalViewState {
             grid: TerminalGrid::new(80, 24),
@@ -180,20 +237,7 @@ impl ShittyAppDelegate {
         let (tx_input, _rx_input) = std::sync::mpsc::channel();
         drop(tx_output);
         let font = load_terminal_font(14.0);
-        let ascender = font.ascender();
-        let descender = font.descender();
-        let leading = font.leading();
-        let cell_height = (ascender - descender + leading).ceil();
-
-        let w_char = ns_string!("W");
-        let attrs: Retained<NSDictionary<NSAttributedStringKey, AnyObject>> = unsafe {
-            NSDictionary::dictionaryWithObject_forKey(
-                cast_any_object(&*font),
-                ProtocolObject::from_ref(objc2_app_kit::NSFontAttributeName),
-            )
-        };
-        let w_size = unsafe { w_char.sizeWithAttributes(Some(&*attrs)) };
-        let cell_width = w_size.width;
+        let (cell_width, cell_height) = measure_cell_size(&font);
 
         TerminalViewState {
             grid: TerminalGrid::new(80, 24),
@@ -214,6 +258,23 @@ fn load_terminal_font(size: f64) -> Retained<NSFont> {
     let font_name = ns_string!("MesloLGS NF");
     NSFont::fontWithName_size(font_name, size)
         .unwrap_or_else(|| NSFont::userFixedPitchFontOfSize(size).unwrap())
+}
+
+fn measure_cell_size(font: &NSFont) -> (f64, f64) {
+    let ascender = font.ascender();
+    let descender = font.descender();
+    let leading = font.leading();
+    let cell_height = (ascender - descender + leading).ceil();
+
+    let w_char = ns_string!("W");
+    let attrs: Retained<NSDictionary<NSAttributedStringKey, AnyObject>> = unsafe {
+        NSDictionary::dictionaryWithObject_forKey(
+            cast_any_object(font),
+            ProtocolObject::from_ref(objc2_app_kit::NSFontAttributeName),
+        )
+    };
+    let w_size = unsafe { w_char.sizeWithAttributes(Some(&*attrs)) };
+    (w_size.width, cell_height)
 }
 
 struct AppDelegateIvars {
@@ -313,10 +374,8 @@ define_class!(
                     }
 
                     let x0 = snap_to_pixel(origin.x + col as f64 * cell_w, scale);
-                    let x1 = snap_to_pixel(
-                        origin.x + (col + run_width) as f64 * cell_w,
-                        scale,
-                    );
+                    let x1 =
+                        snap_to_pixel(origin.x + (col + run_width) as f64 * cell_w, scale);
                     let y0 = snap_to_pixel(
                         origin.y + bounds.size.height - ((row + 1) as f64 * cell_h),
                         scale,
@@ -327,10 +386,8 @@ define_class!(
                     );
                     let rect_w = (x1 - x0).max(0.0);
                     let rect_h = (y1 - y0).max(0.0);
-
                     let font_height = state.font.ascender() - state.font.descender();
                     let text_y_pos = y0 + (rect_h - font_height) / 2.0;
-
                     let rect = NSRect::new(NSPoint::new(x0, y0), NSSize::new(rect_w, rect_h));
 
                     if bg != default_bg {
@@ -343,25 +400,26 @@ define_class!(
                         let text_pos = NSPoint::new(x0, snap_to_pixel(text_y_pos, scale));
                         let fg_color = to_nscolor(fg);
 
-                        let text_attributes: Retained<
-                            NSDictionary<NSAttributedStringKey, AnyObject>,
-                        > = unsafe {
-                            NSDictionary::dictionaryWithObject_forKey(
-                                cast_any_object(&*fg_color),
-                                ProtocolObject::from_ref(
-                                    objc2_app_kit::NSForegroundColorAttributeName,
-                                ),
-                            )
-                        };
-                        let text_attributes =
-                            NSMutableDictionary::dictionaryWithDictionary(&text_attributes);
+                        let text_attrs: Retained<NSDictionary<NSAttributedStringKey, AnyObject>> =
+                            unsafe {
+                                NSDictionary::dictionaryWithObject_forKey(
+                                    cast_any_object(&*fg_color),
+                                    ProtocolObject::from_ref(
+                                        objc2_app_kit::NSForegroundColorAttributeName,
+                                    ),
+                                )
+                            };
+                        let text_attrs =
+                            NSMutableDictionary::dictionaryWithDictionary(&text_attrs);
                         unsafe {
-                            text_attributes.setObject_forKey(
+                            text_attrs.setObject_forKey(
                                 cast_any_object(&*state.font),
                                 ProtocolObject::from_ref(objc2_app_kit::NSFontAttributeName),
                             )
                         };
-                        unsafe { text.drawAtPoint_withAttributes(text_pos, Some(&text_attributes)) };
+                        unsafe {
+                            text.drawAtPoint_withAttributes(text_pos, Some(&text_attrs))
+                        };
                     }
 
                     if underline {
@@ -395,11 +453,8 @@ define_class!(
                         cell_fg
                     }
                 });
-                let cursor_fg = if cursor_bg == cell_bg {
-                    cell_fg
-                } else {
-                    cell_bg
-                };
+                let cursor_fg = if cursor_bg == cell_bg { cell_fg } else { cell_bg };
+
                 let cursor_x0 = snap_to_pixel(origin.x + cursor_col as f64 * cell_w, scale);
                 let cursor_x1 =
                     snap_to_pixel(origin.x + (cursor_col + 1) as f64 * cell_w, scale);
@@ -418,9 +473,9 @@ define_class!(
                         (cursor_y1 - cursor_y0).max(0.0),
                     ),
                 );
-                let cursor_bg = to_nscolor(cursor_bg);
-                let cursor_fg = to_nscolor(cursor_fg);
-                cursor_bg.set();
+                let cursor_bg_color = to_nscolor(cursor_bg);
+                let cursor_fg_color = to_nscolor(cursor_fg);
+                cursor_bg_color.set();
                 NSBezierPath::fillRect(cursor_rect);
 
                 let cursor_rect_h = (cursor_y1 - cursor_y0).max(0.0);
@@ -430,24 +485,23 @@ define_class!(
                     snap_to_pixel(cursor_y0 + (cursor_rect_h - font_height) / 2.0, scale),
                 );
                 let text = NSString::from_str(cell_text);
-                let text_attributes: Retained<NSDictionary<NSAttributedStringKey, AnyObject>> =
+                let text_attrs: Retained<NSDictionary<NSAttributedStringKey, AnyObject>> =
                     unsafe {
                         NSDictionary::dictionaryWithObject_forKey(
-                            cast_any_object(&*cursor_fg),
+                            cast_any_object(&*cursor_fg_color),
                             ProtocolObject::from_ref(
                                 objc2_app_kit::NSForegroundColorAttributeName,
                             ),
                         )
                     };
-                let text_attributes =
-                    NSMutableDictionary::dictionaryWithDictionary(&text_attributes);
+                let text_attrs = NSMutableDictionary::dictionaryWithDictionary(&text_attrs);
                 unsafe {
-                    text_attributes.setObject_forKey(
+                    text_attrs.setObject_forKey(
                         cast_any_object(&*state.font),
                         ProtocolObject::from_ref(objc2_app_kit::NSFontAttributeName),
                     )
                 };
-                unsafe { text.drawAtPoint_withAttributes(text_pos, Some(&text_attributes)) };
+                unsafe { text.drawAtPoint_withAttributes(text_pos, Some(&text_attrs)) };
             }
         }
     }
@@ -527,7 +581,6 @@ impl Drop for TerminalViewIvars {
     }
 }
 
-
 define_class!(
     #[unsafe(super(objc2_foundation::NSObject))]
     #[thread_kind = objc2::MainThreadOnly]
@@ -584,12 +637,8 @@ fn set_winsize_raw(fd: i32, cols: u16, rows: u16) {
     }
 }
 
-// Helper to convert egui colors to NSColor.
 fn to_nscolor(c: egui::Color32) -> Retained<NSColor> {
-    let r = c.r();
-    let g = c.g();
-    let b = c.b();
-    let a = c.a();
+    let [r, g, b, a] = c.to_array();
     NSColor::colorWithSRGBRed_green_blue_alpha(
         r as f64 / 255.0,
         g as f64 / 255.0,
