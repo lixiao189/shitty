@@ -11,15 +11,22 @@ use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThr
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
     NSBackingStoreType, NSBezierPath, NSColor, NSEvent, NSFont, NSResponder, NSStringDrawing,
-    NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSMenu, NSMenuItem, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+};
+use objc2_core_foundation::{CFArray, CFError, CFString, CFType, CFURL, CFRetained};
+use objc2_core_text::{
+    CTFontDescriptor, CTFontManagerCreateFontDescriptorsFromURL, CTFontManagerRegisterFontsForURL,
+    CTFontManagerScope, kCTFontNameAttribute,
 };
 use objc2_foundation::{
     ns_string, NSAttributedStringKey, NSDictionary, NSMutableDictionary, NSPoint, NSRect, NSSize,
     NSString,
 };
+use std::collections::HashSet;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
+use std::sync::OnceLock;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
@@ -55,6 +62,20 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     app.run();
     Ok(())
+}
+
+struct QuitMenuItemSpec {
+    title: &'static str,
+    key_equivalent: &'static str,
+    modifier_mask: objc2_app_kit::NSEventModifierFlags,
+}
+
+fn macos_quit_menu_item_spec() -> QuitMenuItemSpec {
+    QuitMenuItemSpec {
+        title: "Quit shitty",
+        key_equivalent: "q",
+        modifier_mask: objc2_app_kit::NSEventModifierFlags::Command,
+    }
 }
 
 fn spawn_shell(slave_fd: &OwnedFd) -> i32 {
@@ -145,6 +166,7 @@ define_class!(
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn application_did_finish_launching(&self, _notification: &AnyObject) {
             let mtm = self.mtm();
+            setup_main_menu(mtm);
 
             let window = unsafe {
                 NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -254,10 +276,59 @@ impl ShittyAppDelegate {
     }
 }
 
+fn setup_main_menu(mtm: MainThreadMarker) {
+    let app = NSApplication::sharedApplication(mtm);
+
+    // Menu bar with an application menu.
+    let menubar = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!(""));
+    let app_menu_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!(""),
+            None,
+            ns_string!(""),
+        )
+    };
+    menubar.addItem(&app_menu_item);
+    app.setMainMenu(Some(&menubar));
+
+    let app_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!(""));
+    app_menu_item.setSubmenu(Some(&app_menu));
+
+    let quit_spec = macos_quit_menu_item_spec();
+    let quit_title = NSString::from_str(quit_spec.title);
+    let quit_key = NSString::from_str(quit_spec.key_equivalent);
+    let quit_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &quit_title,
+            Some(sel!(terminate:)),
+            &quit_key,
+        )
+    };
+    quit_item.setKeyEquivalentModifierMask(quit_spec.modifier_mask);
+    app_menu.addItem(&quit_item);
+}
+
 fn load_terminal_font(size: f64) -> Retained<NSFont> {
-    let font_name = ns_string!("MesloLGS NF");
-    NSFont::fontWithName_size(font_name, size)
-        .unwrap_or_else(|| NSFont::userFixedPitchFontOfSize(size).unwrap())
+    // Best-effort: make the bundled font usable even when not installed system-wide.
+    let embedded_postscript_names = embedded_monaco_postscript_names();
+
+    // Prefer the requested display name first.
+    let preferred = ns_string!("Monaco Nerd Font Mono");
+    if let Some(font) = NSFont::fontWithName_size(preferred, size) {
+        return font;
+    }
+
+    // Fall back to internal/PostScript names extracted from the bundled fonts.
+    for ps_name in embedded_postscript_names {
+        let name = NSString::from_str(ps_name);
+        if let Some(font) = NSFont::fontWithName_size(&name, size) {
+            return font;
+        }
+    }
+
+    NSFont::userFixedPitchFontOfSize(size).unwrap()
 }
 
 fn measure_cell_size(font: &NSFont) -> (f64, f64) {
@@ -275,6 +346,72 @@ fn measure_cell_size(font: &NSFont) -> (f64, f64) {
     };
     let w_size = unsafe { w_char.sizeWithAttributes(Some(&*attrs)) };
     (w_size.width, cell_height)
+}
+
+static EMBEDDED_MONACO_POSTSCRIPT_NAMES: OnceLock<Vec<String>> = OnceLock::new();
+
+fn embedded_monaco_postscript_names() -> &'static [String] {
+    EMBEDDED_MONACO_POSTSCRIPT_NAMES.get_or_init(|| {
+        let font_paths = [
+            "assets/MonacoNerdFontMono-Regular.ttf",
+            "assets/MonacoNerdFontMono-Bold.ttf",
+            "assets/MonacoNerdFontMono-Italic.ttf",
+            "assets/MonacoNerdFontMono-BoldItalic.ttf",
+        ];
+
+        let mut seen = HashSet::<String>::new();
+        let mut postscript_names = Vec::<String>::new();
+
+        for rel_path in font_paths {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel_path);
+            if !path.exists() {
+                continue;
+            }
+
+            let Some(url) = CFURL::from_file_path(&path) else {
+                continue;
+            };
+
+            // Register the fonts for the current process (best-effort). If this fails due to
+            // being already registered, we'll still try to extract PostScript names below.
+            let mut error: *mut CFError = std::ptr::null_mut();
+            unsafe {
+                let _ = CTFontManagerRegisterFontsForURL(&url, CTFontManagerScope::Process, &mut error);
+            }
+
+            for ps_name in monaco_postscript_names_from_url(&url) {
+                if seen.insert(ps_name.clone()) {
+                    postscript_names.push(ps_name);
+                }
+            }
+        }
+
+        postscript_names
+    })
+}
+
+fn monaco_postscript_names_from_url(url: &CFURL) -> Vec<String> {
+    let Some(descriptors) = (unsafe { CTFontManagerCreateFontDescriptorsFromURL(url) }) else {
+        return Vec::new();
+    };
+    let descriptors: CFRetained<CFArray<CTFontDescriptor>> =
+        unsafe { CFRetained::cast_unchecked(descriptors) };
+
+    let mut out = Vec::<String>::new();
+    for idx in 0..descriptors.len() {
+        // SAFETY: `idx` is in bounds, and `descriptors` isn't mutated.
+        let desc = unsafe { descriptors.get_unchecked(idx as isize) };
+        if let Some(ps_name) = postscript_name_from_descriptor(desc) {
+            out.push(ps_name);
+        }
+    }
+    out
+}
+
+fn postscript_name_from_descriptor(desc: &CTFontDescriptor) -> Option<String> {
+    let value: CFRetained<CFType> = unsafe { desc.attribute(kCTFontNameAttribute) }?;
+    let value: CFRetained<CFString> = value.downcast().ok()?;
+    Some(value.to_string())
 }
 
 struct AppDelegateIvars {
@@ -423,7 +560,8 @@ define_class!(
                     }
 
                     if underline {
-                        let underline_y = y0 + rect_h - 1.0;
+                        // y0 is the cell bottom in NSView coords (y-up), so underline goes at the bottom
+                        let underline_y = y0;
                         let underline_rect = NSRect::new(
                             NSPoint::new(x0, underline_y),
                             NSSize::new(rect_w, 1.0),
@@ -652,4 +790,29 @@ fn snap_to_pixel(value: f64, scale: f64) -> f64 {
         return value;
     }
     (value * scale).round() / scale
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macos_default_terminal_font_prefers_monaco_nerd_font_mono() {
+        let font = load_terminal_font(14.0);
+        let name = font.fontName().to_string();
+        assert!(
+            name.contains("Monaco Nerd Font Mono")
+                || name.contains("MonacoNerdFontMono")
+                || name.contains("MonacoNFM"),
+            "expected Monaco Nerd Font Mono, got: {name}"
+        );
+    }
+
+    #[test]
+    fn macos_command_q_quit_spec_is_standard() {
+        let spec = macos_quit_menu_item_spec();
+        assert_eq!(spec.title, "Quit shitty");
+        assert_eq!(spec.key_equivalent, "q");
+        assert!(spec.modifier_mask.contains(objc2_app_kit::NSEventModifierFlags::Command));
+    }
 }
