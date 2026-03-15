@@ -1,3 +1,5 @@
-fn main() -> eframe::Result<()> {
+use std::error::Error;
+
+fn main() -> Result<(), Box<dyn Error>> {
     shitty::run()
 }

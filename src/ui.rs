@@ -3,7 +3,7 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use crate::keymap::append_input_from_event;
 use crate::pty::PtyEvent;
-use crate::terminal::TerminalGrid;
+use crate::terminal::grid::TerminalGrid;
 
 pub(crate) struct TerminalUI {
     rx_pty_output: Receiver<Vec<u8>>,
@@ -132,15 +132,15 @@ impl eframe::App for TerminalUI {
                             painter.text(pos, egui::Align2::LEFT_TOP, text, font_id.clone(), fg);
                         }
 
-                        if let Some(cell) = &cell
-                            && self.grid.cell_underline(cell)
-                        {
-                            let y = pos.y + cell_h - 1.0;
-                            let rect = egui::Rect::from_min_size(
-                                egui::pos2(pos.x, y),
-                                egui::vec2(cell_w, 1.0),
-                            );
-                            painter.rect_filled(rect, 0.0, fg);
+                        if let Some(cell) = &cell {
+                            if cell.underline {
+                                let y = pos.y + cell_h - 1.0;
+                                let rect = egui::Rect::from_min_size(
+                                    egui::pos2(pos.x, y),
+                                    egui::vec2(cell_w, 1.0),
+                                );
+                                painter.rect_filled(rect, 0.0, fg);
+                            }
                         }
                     }
                 }
