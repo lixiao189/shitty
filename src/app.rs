@@ -81,17 +81,17 @@ fn configure_visuals(cc: &eframe::CreationContext<'_>) {
 
 fn configure_fonts(cc: &eframe::CreationContext<'_>) {
     let font_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("assets/JetBrainsMonoNerdFontMono-Regular.ttf");
+        .join("assets/MonacoNerdFontMono-Regular.ttf");
     if let Ok(font_data) = fs::read(&font_path) {
         let mut fonts = egui::FontDefinitions::default();
         fonts.font_data.insert(
-            "jbmono".to_string(),
+            "monaco".to_string(),
             egui::FontData::from_owned(font_data).into(),
         );
         // Only set monospace font family since this is a terminal
         fonts
             .families
-            .insert(egui::FontFamily::Monospace, vec!["jbmono".to_string()]);
+            .insert(egui::FontFamily::Monospace, vec!["monaco".to_string()]);
         cc.egui_ctx.set_fonts(fonts);
     }
 }
