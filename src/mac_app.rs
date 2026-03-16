@@ -1,6 +1,6 @@
 use crate::keymap;
+use crate::terminal::color::Color32;
 use crate::terminal::grid::TerminalGrid;
-use eframe::egui;
 use nix::libc::{ioctl, killpg, pid_t, setsid, tcgetpgrp, winsize, SIGWINCH, TIOCSCTTY,
                 TIOCSWINSZ};
 use nix::pty::openpty;
@@ -502,7 +502,7 @@ define_class!(
                                 cell.wide_continuation,
                             )
                         } else {
-                            ("", egui::Color32::WHITE, default_bg, false, 1, false)
+                            ("", Color32::WHITE, default_bg, false, 1, false)
                         };
 
                     if skip_cell {
@@ -583,10 +583,10 @@ define_class!(
                         let (fg, bg) = state.grid.resolve_cell_colors(cell);
                         (cell.text.as_str(), fg, bg)
                     })
-                    .unwrap_or((" ", egui::Color32::WHITE, default_bg));
+                    .unwrap_or((" ", Color32::WHITE, default_bg));
                 let cursor_bg = state.grid.cursor_color().unwrap_or_else(|| {
                     if cell_fg == cell_bg {
-                        egui::Color32::WHITE
+                        Color32::WHITE
                     } else {
                         cell_fg
                     }
@@ -775,13 +775,12 @@ fn set_winsize_raw(fd: i32, cols: u16, rows: u16) {
     }
 }
 
-fn to_nscolor(c: egui::Color32) -> Retained<NSColor> {
-    let [r, g, b, a] = c.to_array();
+fn to_nscolor(c: Color32) -> Retained<NSColor> {
     NSColor::colorWithSRGBRed_green_blue_alpha(
-        r as f64 / 255.0,
-        g as f64 / 255.0,
-        b as f64 / 255.0,
-        a as f64 / 255.0,
+        c.r as f64 / 255.0,
+        c.g as f64 / 255.0,
+        c.b as f64 / 255.0,
+        c.a as f64 / 255.0,
     )
 }
 

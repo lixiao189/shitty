@@ -4,11 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-eframe = "0.33.3"
-image = "0.25"
 nix = { version = "0.31.1", features = ["term"] }
 unicode-width = "0.2"
 vt100 = "0.15"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+eframe = "0.33.3"
+image = "0.25"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.3"

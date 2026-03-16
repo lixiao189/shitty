@@ -1,13 +1,11 @@
-use eframe::egui;
-
-use crate::terminal::color::{DEFAULT_BG, DEFAULT_FG, xterm_256_color};
+use crate::terminal::color::{Color32, DEFAULT_BG, DEFAULT_FG, xterm_256_color};
 
 pub(crate) struct TerminalGrid {
     parser: vt100::Parser,
-    palette: [Option<egui::Color32>; 256],
-    default_fg: egui::Color32,
-    default_bg: egui::Color32,
-    cursor_color: Option<egui::Color32>,
+    palette: [Option<Color32>; 256],
+    default_fg: Color32,
+    default_bg: Color32,
+    cursor_color: Option<Color32>,
     has_changes: bool,
 }
 
@@ -35,7 +33,7 @@ impl TerminalGrid {
         self.parser.screen().size().1 as usize // size() returns (rows, cols)
     }
 
-    pub(crate) fn default_bg(&self) -> egui::Color32 {
+    pub(crate) fn default_bg(&self) -> Color32 {
         self.default_bg
     }
 
@@ -43,7 +41,7 @@ impl TerminalGrid {
         !self.parser.screen().hide_cursor()
     }
 
-    pub(crate) fn cursor_color(&self) -> Option<egui::Color32> {
+    pub(crate) fn cursor_color(&self) -> Option<Color32> {
         self.cursor_color
     }
 
@@ -101,7 +99,7 @@ impl TerminalGrid {
         })
     }
 
-    pub(crate) fn resolve_cell_colors(&self, cell: &CellInfo) -> (egui::Color32, egui::Color32) {
+    pub(crate) fn resolve_cell_colors(&self, cell: &CellInfo) -> (Color32, Color32) {
         let (fg, bg) = if cell.inverse {
             (cell.bg, cell.fg)
         } else {
@@ -110,7 +108,7 @@ impl TerminalGrid {
         (fg, bg)
     }
 
-    fn resolve_color(&self, color: vt100::Color, is_fg: bool) -> egui::Color32 {
+    fn resolve_color(&self, color: vt100::Color, is_fg: bool) -> Color32 {
         match color {
             vt100::Color::Default => {
                 if is_fg {
@@ -126,7 +124,7 @@ impl TerminalGrid {
                     xterm_256_color(idx)
                 }
             }
-            vt100::Color::Rgb(r, g, b) => egui::Color32::from_rgb(r, g, b),
+            vt100::Color::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
         }
     }
 }
@@ -134,8 +132,8 @@ impl TerminalGrid {
 #[derive(Clone)]
 pub(crate) struct CellInfo {
     pub text: String,
-    pub fg: egui::Color32,
-    pub bg: egui::Color32,
+    pub fg: Color32,
+    pub bg: Color32,
     #[allow(dead_code)]
     pub bold: bool,
     #[allow(dead_code)]
