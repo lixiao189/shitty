@@ -5,6 +5,11 @@ use crate::keymap::append_input_from_event;
 use crate::pty::PtyEvent;
 use crate::terminal::grid::TerminalGrid;
 
+// Convert terminal Color32 to egui Color32
+fn to_egui_color(c: crate::terminal::color::Color32) -> egui::Color32 {
+    egui::Color32::from_rgba_premultiplied(c.r, c.g, c.b, c.a)
+}
+
 pub(crate) struct TerminalUI {
     rx_pty_output: Receiver<Vec<u8>>,
     tx_pty_input: Sender<PtyEvent>,
@@ -59,7 +64,7 @@ impl eframe::App for TerminalUI {
         let mut needs_repaint = false;
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(self.grid.default_bg()))
+            .frame(egui::Frame::NONE.fill(to_egui_color(self.grid.default_bg())))
             .show(ctx, |ui| {
                 let (cell_w, cell_h) = self.cell_size(ctx);
                 let available = ui.available_size();
@@ -103,7 +108,7 @@ impl eframe::App for TerminalUI {
                 let painter = ui.painter_at(rect);
                 let origin = rect.min;
 
-                painter.rect_filled(rect, 0.0, self.grid.default_bg());
+                painter.rect_filled(rect, 0.0, to_egui_color(self.grid.default_bg()));
 
                 let default_bg = self.grid.default_bg();
 
@@ -127,7 +132,7 @@ impl eframe::App for TerminalUI {
                             let span = if cell.wide { 2 } else { 1 };
                             (cell.text.as_str(), fg, bg, cell.underline, span)
                         } else {
-                            ("", egui::Color32::WHITE, default_bg, false, 1)
+                            ("", crate::terminal::color::Color32::WHITE, default_bg, false, 1)
                         };
 
                         let pos = grid_to_screen(origin, cell_w, cell_h, row, col);
@@ -137,11 +142,11 @@ impl eframe::App for TerminalUI {
                         );
 
                         if bg != default_bg {
-                            painter.rect_filled(rect, 0.0, bg);
+                            painter.rect_filled(rect, 0.0, to_egui_color(bg));
                         }
 
                         if !text.is_empty() && text != " " {
-                            painter.text(pos, egui::Align2::LEFT_TOP, text, font_id.clone(), fg);
+                            painter.text(pos, egui::Align2::LEFT_TOP, text, font_id.clone(), to_egui_color(fg));
                         }
 
                         if underline {
@@ -150,7 +155,7 @@ impl eframe::App for TerminalUI {
                                 egui::pos2(pos.x, y),
                                 egui::vec2(cell_w * col_span as f32, 1.0),
                             );
-                            painter.rect_filled(underline_rect, 0.0, fg);
+                            painter.rect_filled(underline_rect, 0.0, to_egui_color(fg));
                         }
 
                         col += col_span;
@@ -164,13 +169,13 @@ impl eframe::App for TerminalUI {
                     let (cell_fg, cell_bg) = cursor_cell
                         .as_ref()
                         .map(|cell| self.grid.resolve_cell_colors(cell))
-                        .unwrap_or((egui::Color32::WHITE, self.grid.default_bg()));
+                        .unwrap_or((crate::terminal::color::Color32::WHITE, self.grid.default_bg()));
                     let cursor_pos = grid_to_screen(origin, cell_w, cell_h, cursor_row, cursor_col);
                     let cursor_rect =
                         egui::Rect::from_min_size(cursor_pos, egui::vec2(cell_w, cell_h));
                     let cursor_bg = self.grid.cursor_color().unwrap_or_else(|| {
                         if cell_fg == cell_bg {
-                            egui::Color32::WHITE
+                            crate::terminal::color::Color32::WHITE
                         } else {
                             cell_fg
                         }
@@ -180,7 +185,7 @@ impl eframe::App for TerminalUI {
                     } else {
                         cell_bg
                     };
-                    painter.rect_filled(cursor_rect, 0.0, cursor_bg);
+                    painter.rect_filled(cursor_rect, 0.0, to_egui_color(cursor_bg));
                     painter.text(
                         cursor_pos,
                         egui::Align2::LEFT_TOP,
@@ -189,7 +194,7 @@ impl eframe::App for TerminalUI {
                             .map(|cell| cell.text.as_str())
                             .unwrap_or(" "),
                         font_id.clone(),
-                        cursor_fg,
+                        to_egui_color(cursor_fg),
                     );
                 }
 
