@@ -7,11 +7,11 @@ use nix::pty::openpty;
 use nix::unistd::{read, write};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
-use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, AnyThread};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
     NSBackingStoreType, NSBezierPath, NSColor, NSEvent, NSFont, NSResponder, NSStringDrawing,
-    NSMenu, NSMenuItem, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSMenu, NSMenuItem, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask, NSImage,
 };
 use objc2_core_foundation::{CFArray, CFError, CFString, CFType, CFURL, CFRetained};
 use objc2_core_text::{
@@ -29,6 +29,21 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
+
+fn load_app_icon(_mtm: MainThreadMarker) -> Option<Retained<NSImage>> {
+    let icon_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icon.png");
+    if !icon_path.exists() {
+        eprintln!("Warning: Icon file not found at {:?}", icon_path);
+        return None;
+    }
+
+    let path_str = icon_path.to_str()?;
+    let ns_string = NSString::from_str(path_str);
+    let image = NSImage::alloc();
+    let image = NSImage::initWithContentsOfFile(image, &ns_string)?;
+    Some(image)
+}
+
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let pty_result = openpty(None, None)?;
@@ -49,6 +64,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mtm = MainThreadMarker::new().ok_or("must be on main thread")?;
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+
+    // Set application icon
+    if let Some(icon) = load_app_icon(mtm) {
+        unsafe {
+            app.setApplicationIconImage(Some(&icon));
+        }
+    }
 
     let delegate = ShittyAppDelegate::new(
         mtm,
