@@ -7,5 +7,5 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 #[cfg(not(target_os = "macos"))]
 fn main() -> Result<(), Box<dyn Error>> {
-    shitty::app::run()
+    shitty::fallback_app::run()
 }

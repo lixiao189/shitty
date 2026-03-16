@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use nix::libc::{SIGWINCH, TIOCSWINSZ, ioctl, killpg, pid_t, tcgetpgrp, winsize};
 
 pub(crate) enum PtyEvent {

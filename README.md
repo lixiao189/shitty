@@ -86,13 +86,13 @@ flowchart LR
 ## Project Layout
 
 - `src/main.rs`: OS routing (macOS AppKit vs egui).
-- `src/app.rs`: egui bootstrapping, PTY threads, and font setup.
+- `src/fallback_app.rs`: egui bootstrapping, PTY threads, and font setup.
 - `src/mac_app.rs`: native AppKit window, view, and renderer.
-- `src/ui.rs`: egui renderer and input loop.
-- `src/pty.rs`: resize handling and signals (non-macOS).
+- `src/terminal/mod.rs`: terminal module exports.
 - `src/terminal/grid.rs`: vt100 parser wrapper and grid access.
 - `src/terminal/color.rs`: ANSI/xterm color mapping.
-- `src/keymap.rs`: key event translation (egui + macOS).
+- `src/terminal/keymap.rs`: key event translation (egui + macOS).
+- `src/terminal/pty.rs`: resize handling and signals.
 
 ## Notes
 

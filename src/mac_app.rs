@@ -1,4 +1,4 @@
-use crate::keymap;
+use crate::terminal::keymap;
 use crate::terminal::color::Color32;
 use crate::terminal::grid::TerminalGrid;
 use nix::libc::{ioctl, killpg, pid_t, setsid, tcgetpgrp, winsize, SIGWINCH, TIOCSCTTY,
