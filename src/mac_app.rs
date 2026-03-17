@@ -1,34 +1,40 @@
-use crate::terminal::keymap;
 use crate::terminal::color::Color32;
 use crate::terminal::grid::TerminalGrid;
-use nix::libc::{ioctl, killpg, pid_t, setsid, tcgetpgrp, winsize, SIGWINCH, TIOCSCTTY,
-                TIOCSWINSZ};
+use crate::terminal::keymap;
+use nix::libc::{
+    SIGWINCH, TIOCSCTTY, TIOCSWINSZ, ioctl, killpg, pid_t, setsid, tcgetpgrp, winsize,
+};
 use nix::pty::openpty;
 use nix::unistd::{read, write};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
-use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, AnyThread};
+use objc2::{
+    AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
+};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
-    NSBackingStoreType, NSBezierPath, NSColor, NSEvent, NSFont, NSResponder, NSStringDrawing,
-    NSMenu, NSMenuItem, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask, NSImage,
+    NSBackingStoreType, NSBezierPath, NSColor, NSEvent, NSFont, NSImage, NSMenu, NSMenuItem,
+    NSResponder, NSStringDrawing, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
-use objc2_core_foundation::{CFArray, CFError, CFString, CFType, CFURL, CFRetained};
+use objc2_core_foundation::{CFArray, CFError, CFRetained, CFString, CFType, CFURL};
 use objc2_core_text::{
     CTFontDescriptor, CTFontManagerCreateFontDescriptorsFromURL, CTFontManagerRegisterFontsForURL,
     CTFontManagerScope, kCTFontNameAttribute,
 };
 use objc2_foundation::{
-    ns_string, NSAttributedStringKey, NSDictionary, NSMutableDictionary, NSPoint, NSRect, NSSize,
-    NSString,
+    NSAttributedStringKey, NSDictionary, NSMutableDictionary, NSPoint, NSRect, NSSize, NSString,
+    ns_string,
 };
 use std::collections::HashSet;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::sync::OnceLock;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
+
+/// Refresh rate for the terminal rendering timer (in Hz)
+const RENDER_REFRESH_RATE_HZ: f64 = 120.0;
 
 fn load_app_icon(_mtm: MainThreadMarker) -> Option<Retained<NSImage>> {
     let icon_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icon.png");
@@ -43,7 +49,6 @@ fn load_app_icon(_mtm: MainThreadMarker) -> Option<Retained<NSImage>> {
     let image = NSImage::initWithContentsOfFile(image, &ns_string)?;
     Some(image)
 }
-
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let pty_result = openpty(None, None)?;
@@ -130,16 +135,18 @@ fn spawn_pty_threads(
     tx_pty_output: Sender<Vec<u8>>,
     rx_pty_input: Receiver<Vec<u8>>,
 ) {
-    thread::spawn(move || loop {
-        let mut buffer = [0u8; 8192];
-        match read(master_read.as_fd(), &mut buffer) {
-            Ok(0) => break,
-            Ok(n) => {
-                if tx_pty_output.send(buffer[..n].to_vec()).is_err() {
-                    break;
+    thread::spawn(move || {
+        loop {
+            let mut buffer = [0u8; 8192];
+            match read(master_read.as_fd(), &mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx_pty_output.send(buffer[..n].to_vec()).is_err() {
+                        break;
+                    }
                 }
+                Err(_) => break,
             }
-            Err(_) => break,
         }
     });
 
@@ -246,8 +253,9 @@ impl ShittyAppDelegate {
         slave_fd: OwnedFd,
         shell_pgid: pid_t,
     ) -> Retained<Self> {
-        let view_state =
-            Self::terminal_state_from_channels(rx_output, tx_input, master_fd, slave_fd, shell_pgid);
+        let view_state = Self::terminal_state_from_channels(
+            rx_output, tx_input, master_fd, slave_fd, shell_pgid,
+        );
         let this = Self::alloc(mtm).set_ivars(AppDelegateIvars::new(mtm, view_state));
         unsafe { msg_send![super(this), init] }
     }
@@ -398,7 +406,8 @@ fn embedded_monaco_postscript_names() -> &'static [String] {
             // being already registered, we'll still try to extract PostScript names below.
             let mut error: *mut CFError = std::ptr::null_mut();
             unsafe {
-                let _ = CTFontManagerRegisterFontsForURL(&url, CTFontManagerScope::Process, &mut error);
+                let _ =
+                    CTFontManagerRegisterFontsForURL(&url, CTFontManagerScope::Process, &mut error);
             }
 
             for ps_name in monaco_postscript_names_from_url(&url) {
@@ -680,7 +689,7 @@ impl ShittyTerminalView {
         let timer_target = TimerTarget::new(mtm, &view);
         let timer = unsafe {
             objc2_foundation::NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
-                1.0 / 60.0,
+                1.0 / RENDER_REFRESH_RATE_HZ,
                 &timer_target,
                 sel!(onTimerTick:),
                 None,
@@ -834,6 +843,9 @@ mod tests {
         let spec = macos_quit_menu_item_spec();
         assert_eq!(spec.title, "Quit shitty");
         assert_eq!(spec.key_equivalent, "q");
-        assert!(spec.modifier_mask.contains(objc2_app_kit::NSEventModifierFlags::Command));
+        assert!(
+            spec.modifier_mask
+                .contains(objc2_app_kit::NSEventModifierFlags::Command)
+        );
     }
 }
