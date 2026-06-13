@@ -90,8 +90,6 @@ impl TerminalGrid {
             text: cell.contents(),
             fg: self.resolve_color(cell.fgcolor(), true),
             bg: self.resolve_color(cell.bgcolor(), false),
-            bold: cell.bold(),
-            italic: cell.italic(),
             underline: cell.underline(),
             inverse: cell.inverse(),
             wide: cell.is_wide(),
@@ -134,10 +132,6 @@ pub(crate) struct CellInfo {
     pub text: String,
     pub fg: Color32,
     pub bg: Color32,
-    #[allow(dead_code)]
-    pub bold: bool,
-    #[allow(dead_code)]
-    pub italic: bool,
     pub underline: bool,
     pub inverse: bool,
     pub wide: bool,

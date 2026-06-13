@@ -1,9 +1,7 @@
 use crate::terminal::color::Color32;
 use crate::terminal::grid::TerminalGrid;
 use crate::terminal::keymap;
-use nix::libc::{
-    SIGWINCH, TIOCSCTTY, TIOCSWINSZ, ioctl, killpg, pid_t, setsid, tcgetpgrp, winsize,
-};
+use nix::libc::pid_t;
 use nix::pty::openpty;
 use nix::unistd::{read, write};
 use objc2::rc::Retained;
@@ -27,8 +25,7 @@ use objc2_foundation::{
 };
 use std::collections::HashSet;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-use std::os::unix::process::CommandExt;
-use std::process::Command;
+
 use std::sync::OnceLock;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
@@ -54,7 +51,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let pty_result = openpty(None, None)?;
     let master_fd = pty_result.master;
     let slave_fd = pty_result.slave;
-    let shell_pgid = spawn_shell(&slave_fd);
+    let shell_pgid = crate::terminal::pty::spawn_shell(&slave_fd);
 
     let (tx_pty_output, rx_pty_output) = channel::<Vec<u8>>();
     let (tx_pty_input, rx_pty_input) = channel::<Vec<u8>>();
@@ -62,8 +59,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let master_read = master_fd.try_clone().expect("master fd clone failed");
     let master_write = master_fd.try_clone().expect("master fd clone failed");
     let master_ui = master_fd;
-    let slave_ui = slave_fd.try_clone().expect("slave fd clone failed");
-
     spawn_pty_threads(master_read, master_write, tx_pty_output, rx_pty_input);
 
     let mtm = MainThreadMarker::new().ok_or("must be on main thread")?;
@@ -82,7 +77,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         rx_pty_output,
         tx_pty_input,
         master_ui,
-        slave_ui,
         shell_pgid,
     );
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
@@ -105,27 +99,7 @@ fn macos_quit_menu_item_spec() -> QuitMenuItemSpec {
     }
 }
 
-fn spawn_shell(slave_fd: &OwnedFd) -> i32 {
-    unsafe {
-        let ctty_fd = slave_fd.try_clone().expect("slave fd clone failed");
-        let mut child = Command::new("/bin/zsh")
-            .stdin(slave_fd.try_clone().expect("slave fd clone failed"))
-            .stdout(slave_fd.try_clone().expect("slave fd clone failed"))
-            .stderr(slave_fd.try_clone().expect("slave fd clone failed"))
-            .pre_exec(move || {
-                let _ = setsid();
-                let _ = ioctl(ctty_fd.as_raw_fd(), TIOCSCTTY as _, 0);
-                Ok(())
-            })
-            .spawn()
-            .expect("Failed to spawn shell");
-        let pid = child.id() as i32;
-        thread::spawn(move || {
-            let _ = child.wait();
-        });
-        pid
-    }
-}
+
 
 // No PtyEvent on the macOS path — AppKit timer drives rendering and resize is
 // handled directly in the view's setFrameSize handler.
@@ -171,7 +145,6 @@ struct TerminalViewState {
     cell_height: f64,
     timer: Option<Retained<objc2_foundation::NSTimer>>,
     master_fd: Option<OwnedFd>,
-    slave_fd: Option<OwnedFd>,
     shell_pgid: pid_t,
 }
 
@@ -250,11 +223,10 @@ impl ShittyAppDelegate {
         rx_output: Receiver<Vec<u8>>,
         tx_input: Sender<Vec<u8>>,
         master_fd: OwnedFd,
-        slave_fd: OwnedFd,
         shell_pgid: pid_t,
     ) -> Retained<Self> {
         let view_state = Self::terminal_state_from_channels(
-            rx_output, tx_input, master_fd, slave_fd, shell_pgid,
+            rx_output, tx_input, master_fd, shell_pgid,
         );
         let this = Self::alloc(mtm).set_ivars(AppDelegateIvars::new(mtm, view_state));
         unsafe { msg_send![super(this), init] }
@@ -264,7 +236,6 @@ impl ShittyAppDelegate {
         rx_output: Receiver<Vec<u8>>,
         tx_input: Sender<Vec<u8>>,
         master_fd: OwnedFd,
-        slave_fd: OwnedFd,
         shell_pgid: pid_t,
     ) -> TerminalViewState {
         let font = load_terminal_font(14.0);
@@ -279,7 +250,6 @@ impl ShittyAppDelegate {
             cell_height,
             timer: None,
             master_fd: Some(master_fd),
-            slave_fd: Some(slave_fd),
             shell_pgid,
         }
     }
@@ -300,7 +270,6 @@ impl ShittyAppDelegate {
             cell_height,
             timer: None,
             master_fd: None,
-            slave_fd: None,
             shell_pgid: 0,
         }
     }
@@ -719,16 +688,12 @@ impl ShittyTerminalView {
             return;
         }
         if let Some(master_fd) = state.master_fd.as_ref() {
-            set_winsize_raw(master_fd.as_raw_fd(), cols as u16, rows as u16);
-        }
-        if let Some(slave_fd) = state.slave_fd.as_ref() {
-            let pgid = unsafe { tcgetpgrp(slave_fd.as_raw_fd()) };
-            let target_pgid = if pgid > 0 { pgid } else { state.shell_pgid };
-            if target_pgid > 0 {
-                unsafe {
-                    let _ = killpg(target_pgid, SIGWINCH);
-                }
-            }
+            crate::terminal::pty::apply_resize(
+                master_fd.as_raw_fd(),
+                cols as u16,
+                rows as u16,
+                state.shell_pgid,
+            );
         }
         self.setNeedsDisplay(true);
     }
@@ -794,17 +759,7 @@ fn cast_any_object<T: ?Sized>(obj: &T) -> &AnyObject {
     unsafe { &*(obj as *const T as *const AnyObject) }
 }
 
-fn set_winsize_raw(fd: i32, cols: u16, rows: u16) {
-    let ws = winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    unsafe {
-        let _ = ioctl(fd, TIOCSWINSZ, &ws);
-    }
-}
+
 
 fn to_nscolor(c: Color32) -> Retained<NSColor> {
     NSColor::colorWithSRGBRed_green_blue_alpha(

@@ -1,26 +1,23 @@
 use eframe::egui::{self};
 use egui::IconData;
 use image::GenericImageView;
-use nix::libc::{ioctl, setsid, TIOCSCTTY};
 use nix::pty::openpty;
 use nix::unistd::{read, write};
 use std::fs;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-use std::os::unix::process::CommandExt;
-use std::process::Command;
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
-use crate::terminal::keymap::append_input_from_event;
-use crate::terminal::pty::{apply_resize, PtyEvent};
 use crate::terminal::grid::TerminalGrid;
+use crate::terminal::keymap::append_input_from_event;
+use crate::terminal::pty::{PtyEvent, apply_resize};
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let pty_result = openpty(None, None)?;
     let master_fd = pty_result.master;
     let slave_fd = pty_result.slave;
-    let shell_pgid = spawn_shell(&slave_fd);
+    let shell_pgid = crate::terminal::pty::spawn_shell(&slave_fd);
 
     let icon_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icon.png");
     let icon_data = if let Ok(img) = image::open(&icon_path) {
@@ -95,27 +92,7 @@ fn configure_fonts(cc: &eframe::CreationContext<'_>) {
     }
 }
 
-fn spawn_shell(slave_fd: &OwnedFd) -> i32 {
-    unsafe {
-        let ctty_fd = slave_fd.try_clone().expect("slave fd clone failed");
-        let mut child = Command::new("/bin/zsh")
-            .stdin(slave_fd.try_clone().expect("slave fd clone failed"))
-            .stdout(slave_fd.try_clone().expect("slave fd clone failed"))
-            .stderr(slave_fd.try_clone().expect("slave fd clone failed"))
-            .pre_exec(move || {
-                let _ = setsid();
-                let _ = ioctl(ctty_fd.as_raw_fd(), TIOCSCTTY as _, 0);
-                Ok(())
-            })
-            .spawn()
-            .expect("Failed to spawn shell");
-        let pid = child.id() as i32;
-        thread::spawn(move || {
-            let _ = child.wait();
-        });
-        pid
-    }
-}
+
 
 // PtyEvent carries both input bytes and resize signals; ctx.request_repaint()
 // wakes the egui loop whenever new PTY output arrives.
@@ -127,17 +104,19 @@ fn spawn_pty_threads(
     ctx: egui::Context,
     shell_pgid: i32,
 ) {
-    thread::spawn(move || loop {
-        let mut buffer = [0u8; 8192];
-        match read(master_read.as_fd(), &mut buffer) {
-            Ok(0) => break,
-            Ok(n) => {
-                if tx_pty_output.send(buffer[..n].to_vec()).is_err() {
-                    break;
+    thread::spawn(move || {
+        loop {
+            let mut buffer = [0u8; 8192];
+            match read(master_read.as_fd(), &mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx_pty_output.send(buffer[..n].to_vec()).is_err() {
+                        break;
+                    }
+                    ctx.request_repaint();
                 }
-                ctx.request_repaint();
+                Err(_) => break,
             }
-            Err(_) => break,
         }
     });
 
@@ -158,9 +137,7 @@ fn spawn_pty_threads(
 }
 
 // Convert terminal Color32 to egui Color32
-fn to_egui_color(c: crate::terminal::color::Color32) -> egui::Color32 {
-    egui::Color32::from_rgba_premultiplied(c.r, c.g, c.b, c.a)
-}
+
 
 struct TerminalUI {
     rx_pty_output: Receiver<Vec<u8>>,
@@ -214,7 +191,7 @@ impl eframe::App for TerminalUI {
         let mut needs_repaint = false;
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(to_egui_color(self.grid.default_bg())))
+            .frame(egui::Frame::NONE.fill(self.grid.default_bg().into()))
             .show(ctx, |ui| {
                 let (cell_w, cell_h) = self.cell_size(ctx);
                 let available = ui.available_size();
@@ -255,7 +232,7 @@ impl eframe::App for TerminalUI {
                 let painter = ui.painter_at(rect);
                 let origin = rect.min;
 
-                painter.rect_filled(rect, 0.0, to_egui_color(self.grid.default_bg()));
+                painter.rect_filled(rect, 0.0, self.grid.default_bg().into());
 
                 let default_bg = self.grid.default_bg();
                 let font_id = &self.font_id;
@@ -275,7 +252,13 @@ impl eframe::App for TerminalUI {
                             let span = if cell.wide { 2 } else { 1 };
                             (cell.text.as_str(), fg, bg, cell.underline, span)
                         } else {
-                            ("", crate::terminal::color::Color32::WHITE, default_bg, false, 1)
+                            (
+                                "",
+                                crate::terminal::color::Color32::WHITE,
+                                default_bg,
+                                false,
+                                1,
+                            )
                         };
 
                         let pos = grid_to_screen(origin, cell_w, cell_h, row, col);
@@ -285,11 +268,17 @@ impl eframe::App for TerminalUI {
                         );
 
                         if bg != default_bg {
-                            painter.rect_filled(rect, 0.0, to_egui_color(bg));
+                            painter.rect_filled(rect, 0.0, bg.into());
                         }
 
                         if !text.is_empty() && text != " " {
-                            painter.text(pos, egui::Align2::LEFT_TOP, text, font_id.clone(), to_egui_color(fg));
+                            painter.text(
+                                pos,
+                                egui::Align2::LEFT_TOP,
+                                text,
+                                font_id.clone(),
+                                fg.into(),
+                            );
                         }
 
                         if underline {
@@ -298,7 +287,7 @@ impl eframe::App for TerminalUI {
                                 egui::pos2(pos.x, y),
                                 egui::vec2(cell_w * col_span as f32, 1.0),
                             );
-                            painter.rect_filled(underline_rect, 0.0, to_egui_color(fg));
+                            painter.rect_filled(underline_rect, 0.0, fg.into());
                         }
 
                         col += col_span;
@@ -311,7 +300,10 @@ impl eframe::App for TerminalUI {
                     let (cell_fg, cell_bg) = cursor_cell
                         .as_ref()
                         .map(|cell| self.grid.resolve_cell_colors(cell))
-                        .unwrap_or((crate::terminal::color::Color32::WHITE, self.grid.default_bg()));
+                        .unwrap_or((
+                            crate::terminal::color::Color32::WHITE,
+                            self.grid.default_bg(),
+                        ));
                     let cursor_pos = grid_to_screen(origin, cell_w, cell_h, cursor_row, cursor_col);
                     let cursor_rect =
                         egui::Rect::from_min_size(cursor_pos, egui::vec2(cell_w, cell_h));
@@ -327,7 +319,7 @@ impl eframe::App for TerminalUI {
                     } else {
                         cell_bg
                     };
-                    painter.rect_filled(cursor_rect, 0.0, to_egui_color(cursor_bg));
+                    painter.rect_filled(cursor_rect, 0.0, cursor_bg.into());
                     painter.text(
                         cursor_pos,
                         egui::Align2::LEFT_TOP,
@@ -336,7 +328,7 @@ impl eframe::App for TerminalUI {
                             .map(|cell| cell.text.as_str())
                             .unwrap_or(" "),
                         font_id.clone(),
-                        to_egui_color(cursor_fg),
+                        cursor_fg.into(),
                     );
                 }
 

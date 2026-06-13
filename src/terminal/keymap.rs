@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 #[cfg(not(target_os = "macos"))]
 pub(crate) use egui_keymap::*;
 #[cfg(target_os = "macos")]
