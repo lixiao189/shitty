@@ -87,79 +87,69 @@ pub mod egui_keymap {
 
 #[cfg(target_os = "macos")]
 pub mod macos_keymap {
-    use objc2::rc::autoreleasepool;
-    use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
+    use objc2::runtime::Sel;
 
-    pub(crate) fn append_input_from_nsevent(event: &NSEvent, out: &mut Vec<u8>) {
-        if event.r#type() != NSEventType::KeyDown {
-            return;
-        }
-
-        let modifiers = event.modifierFlags();
-        let key_code = event.keyCode();
-
-        // Handle special keys first
-        let handled = match key_code {
-            53 => {
-                // Escape
-                out.push(0x1b);
-                true
-            }
-            36 => {
-                // Enter
-                out.push(b'\r');
-                true
-            }
-            51 => {
-                // Backspace
-                out.push(0x7f);
-                true
-            }
-            48 => {
-                // Tab
-                out.push(b'\t');
-                true
-            }
-            126 => {
-                // ArrowUp
-                out.extend_from_slice(b"\x1b[A");
-                true
-            }
-            125 => {
-                // ArrowDown
-                out.extend_from_slice(b"\x1b[B");
-                true
-            }
-            124 => {
-                // ArrowRight
-                out.extend_from_slice(b"\x1b[C");
-                true
-            }
-            123 => {
-                // ArrowLeft
-                out.extend_from_slice(b"\x1b[D");
-                true
-            }
-            _ => false,
+    pub(crate) fn append_input_from_selector(selector: Sel, out: &mut Vec<u8>) -> bool {
+        let Ok(name) = selector.name().to_str() else {
+            return false;
         };
+        match name {
+            "insertNewline:" => out.push(b'\r'),
+            "deleteBackward:" => out.push(0x7f),
+            "insertTab:" => out.push(b'\t'),
+            "cancelOperation:" => out.push(0x1b),
+            "moveLeft:" => out.extend_from_slice(b"\x1b[D"),
+            "moveRight:" => out.extend_from_slice(b"\x1b[C"),
+            "moveUp:" => out.extend_from_slice(b"\x1b[A"),
+            "moveDown:" => out.extend_from_slice(b"\x1b[B"),
+            _ => return false,
+        }
+        true
+    }
 
-        if handled {
+    pub(crate) fn append_input_from_text(text: &str, out: &mut Vec<u8>) {
+        if text.is_empty() {
             return;
         }
+        if text.len() == 1 {
+            let byte = text.as_bytes()[0];
+            if byte < 0x20 || byte == 0x7f {
+                out.push(byte);
+                return;
+            }
+        }
+        out.extend_from_slice(text.as_bytes());
+    }
 
-        let chars = event.characters().unwrap();
-        let chars_str = autoreleasepool(|pool| unsafe { chars.to_str(pool).to_string() });
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use objc2::sel;
 
-        if modifiers.contains(NSEventModifierFlags::Control)
-            && let Some(first_char) = chars_str.chars().next()
-            && first_char.is_ascii_alphabetic()
-        {
-            out.push(first_char.to_ascii_uppercase() as u8 - b'A' + 1);
-            return;
+        #[test]
+        fn selector_maps_editing_commands() {
+            let mut out = Vec::new();
+            assert!(append_input_from_selector(sel!(insertNewline:), &mut out));
+            assert_eq!(out, b"\r");
+
+            out.clear();
+            assert!(append_input_from_selector(sel!(deleteBackward:), &mut out));
+            assert_eq!(out, &[0x7f]);
+
+            out.clear();
+            assert!(append_input_from_selector(sel!(moveUp:), &mut out));
+            assert_eq!(out, b"\x1b[A");
         }
 
-        if !chars_str.is_empty() {
-            out.extend_from_slice(chars_str.as_bytes());
+        #[test]
+        fn text_appends_control_chars() {
+            let mut out = Vec::new();
+            append_input_from_text("\x03", &mut out);
+            assert_eq!(out, &[0x03]);
+
+            out.clear();
+            append_input_from_text("hello", &mut out);
+            assert_eq!(out, b"hello");
         }
     }
 }

@@ -4,15 +4,16 @@ use crate::terminal::keymap;
 use nix::libc::pid_t;
 use nix::pty::openpty;
 use nix::unistd::{read, write};
-use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
+use objc2::rc::{Retained, autoreleasepool};
+use objc2::runtime::{AnyObject, Bool, NSObjectProtocol, ProtocolObject, Sel};
 use objc2::{
     AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
     NSBackingStoreType, NSBezierPath, NSColor, NSEvent, NSFont, NSImage, NSMenu, NSMenuItem,
-    NSResponder, NSStringDrawing, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSResponder, NSStringDrawing, NSTextInputClient, NSView, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask,
 };
 use objc2_core_foundation::{CFArray, CFError, CFRetained, CFString, CFType, CFURL};
 use objc2_core_text::{
@@ -20,8 +21,8 @@ use objc2_core_text::{
     CTFontManagerScope, kCTFontNameAttribute,
 };
 use objc2_foundation::{
-    NSAttributedStringKey, NSDictionary, NSMutableDictionary, NSPoint, NSRect, NSSize, NSString,
-    ns_string,
+    NSAttributedString, NSAttributedStringKey, NSArray, NSDictionary, NSMutableDictionary,
+    NSNotFound, NSPoint, NSRange, NSRect, NSSize, NSString, NSUInteger, ns_string,
 };
 use std::collections::HashSet;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -146,6 +147,35 @@ struct TerminalViewState {
     timer: Option<Retained<objc2_foundation::NSTimer>>,
     master_fd: Option<OwnedFd>,
     shell_pgid: pid_t,
+    marked_text: String,
+    ime_composing: bool,
+    had_composition: bool,
+    skip_next_command: bool,
+}
+
+impl TerminalViewState {
+    fn send_input(&self, bytes: Vec<u8>) {
+        if !bytes.is_empty() {
+            let _ = self.tx_input.send(bytes);
+        }
+    }
+
+    fn cursor_cell_rect(&self, bounds: NSRect) -> NSRect {
+        let origin = bounds.origin;
+        let (cell_w, cell_h) = (self.cell_width, self.cell_height);
+        let (cursor_row, cursor_col) = self.grid.cursor_pos();
+        let x0 = origin.x + cursor_col as f64 * cell_w;
+        let y0 = origin.y + bounds.size.height - ((cursor_row + 1) as f64 * cell_h);
+        NSRect::new(NSPoint::new(x0, y0), NSSize::new(cell_w, cell_h))
+    }
+
+    fn marked_text_range(&self) -> NSRange {
+        if self.marked_text.is_empty() {
+            return NSRange::new(NSNotFound as NSUInteger, 0);
+        }
+        let ns = NSString::from_str(&self.marked_text);
+        NSRange::new(0, ns.length())
+    }
 }
 
 impl Drop for TerminalViewState {
@@ -251,6 +281,10 @@ impl ShittyAppDelegate {
             timer: None,
             master_fd: Some(master_fd),
             shell_pgid,
+            marked_text: String::new(),
+            ime_composing: false,
+            had_composition: false,
+            skip_next_command: false,
         }
     }
 
@@ -271,6 +305,10 @@ impl ShittyAppDelegate {
             timer: None,
             master_fd: None,
             shell_pgid: 0,
+            marked_text: String::new(),
+            ime_composing: false,
+            had_composition: false,
+            skip_next_command: false,
         }
     }
 }
@@ -453,14 +491,14 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
-            let mut input_bytes = Vec::new();
-            keymap::append_input_from_nsevent(event, &mut input_bytes);
-            if !input_bytes.is_empty() {
-                let state_ptr = self.ivars().state;
-                if let Some(state) = unsafe { state_ptr.as_ref() } {
-                    let _ = state.tx_input.send(input_bytes);
-                }
+            let state_ptr = self.ivars().state;
+            if let Some(state) = unsafe { state_ptr.as_mut() } {
+                state.had_composition = state.ime_composing;
+                state.marked_text.clear();
+                state.skip_next_command = false;
             }
+            let events = NSArray::from_slice(&[event]);
+            self.interpretKeyEvents(&events);
         }
 
         #[unsafe(method(drawRect:))]
@@ -641,6 +679,197 @@ define_class!(
                 };
                 unsafe { text.drawAtPoint_withAttributes(text_pos, Some(&text_attrs)) };
             }
+
+            if !state.marked_text.is_empty() {
+                let (cursor_row, cursor_col) = state.grid.cursor_pos();
+                let marked_x0 = snap_to_pixel(origin.x + cursor_col as f64 * cell_w, scale);
+                let marked_y0 = snap_to_pixel(
+                    origin.y + bounds.size.height - ((cursor_row + 1) as f64 * cell_h),
+                    scale,
+                );
+                let marked_y1 = snap_to_pixel(
+                    origin.y + bounds.size.height - (cursor_row as f64 * cell_h),
+                    scale,
+                );
+                let marked_rect_h = (marked_y1 - marked_y0).max(0.0);
+                let font_height = state.font.ascender() - state.font.descender();
+                let marked_text_pos = NSPoint::new(
+                    marked_x0,
+                    snap_to_pixel(marked_y0 + (marked_rect_h - font_height) / 2.0, scale),
+                );
+                let marked_fg = NSColor::colorWithSRGBRed_green_blue_alpha(0.7, 0.7, 0.7, 1.0);
+                let marked_str = NSString::from_str(&state.marked_text);
+                let marked_attrs: Retained<NSDictionary<NSAttributedStringKey, AnyObject>> =
+                    unsafe {
+                        NSDictionary::dictionaryWithObject_forKey(
+                            cast_any_object(&*marked_fg),
+                            ProtocolObject::from_ref(
+                                objc2_app_kit::NSForegroundColorAttributeName,
+                            ),
+                        )
+                    };
+                let marked_attrs =
+                    NSMutableDictionary::dictionaryWithDictionary(&marked_attrs);
+                unsafe {
+                    marked_attrs.setObject_forKey(
+                        cast_any_object(&*state.font),
+                        ProtocolObject::from_ref(objc2_app_kit::NSFontAttributeName),
+                    )
+                };
+                unsafe {
+                    marked_str.drawAtPoint_withAttributes(marked_text_pos, Some(&marked_attrs))
+                };
+                let underline_rect = NSRect::new(
+                    NSPoint::new(marked_x0, marked_y0),
+                    NSSize::new(
+                        (state.marked_text.len() as f64 * cell_w).max(cell_w),
+                        1.0,
+                    ),
+                );
+                marked_fg.set();
+                NSBezierPath::fillRect(underline_rect);
+            }
+        }
+    }
+
+    unsafe impl NSTextInputClient for ShittyTerminalView {
+        #[unsafe(method(insertText:replacementRange:))]
+        fn insert_text_replacement_range(&self, string: &AnyObject, _replacement_range: NSRange) {
+            let Some(text) = ns_object_to_string(string) else {
+                return;
+            };
+            let state_ptr = self.ivars().state;
+            let Some(state) = (unsafe { state_ptr.as_mut() }) else {
+                return;
+            };
+
+            let had_composition = state.had_composition;
+            state.marked_text.clear();
+            state.ime_composing = false;
+            state.had_composition = false;
+
+            let mut input_bytes = Vec::new();
+            keymap::append_input_from_text(&text, &mut input_bytes);
+            state.send_input(input_bytes);
+
+            if had_composition {
+                state.skip_next_command = true;
+            }
+            self.setNeedsDisplay(true);
+        }
+
+        #[unsafe(method(doCommandBySelector:))]
+        fn do_command_by_selector(&self, selector: Sel) {
+            let state_ptr = self.ivars().state;
+            let Some(state) = (unsafe { state_ptr.as_mut() }) else {
+                return;
+            };
+
+            if state.skip_next_command {
+                state.skip_next_command = false;
+                return;
+            }
+
+            let mut input_bytes = Vec::new();
+            if keymap::append_input_from_selector(selector, &mut input_bytes) {
+                state.send_input(input_bytes);
+            }
+        }
+
+        #[unsafe(method(setMarkedText:selectedRange:replacementRange:))]
+        fn set_marked_text_selected_range_replacement_range(
+            &self,
+            string: &AnyObject,
+            _selected_range: NSRange,
+            _replacement_range: NSRange,
+        ) {
+            let text = ns_object_to_string(string).unwrap_or_default();
+            let state_ptr = self.ivars().state;
+            let Some(state) = (unsafe { state_ptr.as_mut() }) else {
+                return;
+            };
+
+            state.marked_text = text;
+            state.ime_composing = !state.marked_text.is_empty();
+            state.had_composition = false;
+            self.setNeedsDisplay(true);
+        }
+
+        #[unsafe(method(unmarkText))]
+        fn unmark_text(&self) {
+            let state_ptr = self.ivars().state;
+            let Some(state) = (unsafe { state_ptr.as_mut() }) else {
+                return;
+            };
+
+            state.marked_text.clear();
+            state.ime_composing = false;
+            self.setNeedsDisplay(true);
+        }
+
+        #[unsafe(method(selectedRange))]
+        fn selected_range(&self) -> NSRange {
+            let state_ptr = self.ivars().state;
+            let Some(state) = (unsafe { state_ptr.as_ref() }) else {
+                return NSRange::new(NSNotFound as NSUInteger, 0);
+            };
+            state.marked_text_range()
+        }
+
+        #[unsafe(method(markedRange))]
+        fn marked_range(&self) -> NSRange {
+            let state_ptr = self.ivars().state;
+            let Some(state) = (unsafe { state_ptr.as_ref() }) else {
+                return NSRange::new(NSNotFound as NSUInteger, 0);
+            };
+            state.marked_text_range()
+        }
+
+        #[unsafe(method(hasMarkedText))]
+        fn has_marked_text(&self) -> Bool {
+            let state_ptr = self.ivars().state;
+            let Some(state) = (unsafe { state_ptr.as_ref() }) else {
+                return Bool::NO;
+            };
+            (!state.marked_text.is_empty()).into()
+        }
+
+        #[unsafe(method_id(attributedSubstringForProposedRange:actualRange:))]
+        fn attributed_substring_for_proposed_range_actual_range(
+            &self,
+            _range: NSRange,
+            _actual_range: *mut NSRange,
+        ) -> Option<Retained<NSAttributedString>> {
+            None
+        }
+
+        #[unsafe(method_id(validAttributesForMarkedText))]
+        fn valid_attributes_for_marked_text(&self) -> Retained<NSArray<NSAttributedStringKey>> {
+            NSArray::new()
+        }
+
+        #[unsafe(method(firstRectForCharacterRange:actualRange:))]
+        fn first_rect_for_character_range_actual_range(
+            &self,
+            _range: NSRange,
+            _actual_range: *mut NSRange,
+        ) -> NSRect {
+            let Some(window) = self.window() else {
+                return NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
+            };
+
+            let state_ptr = self.ivars().state;
+            let Some(state) = (unsafe { state_ptr.as_ref() }) else {
+                return NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
+            };
+
+            let view_rect = state.cursor_cell_rect(self.bounds());
+            window.convertRectToScreen(view_rect)
+        }
+
+        #[unsafe(method(characterIndexForPoint:))]
+        fn character_index_for_point(&self, _point: NSPoint) -> NSUInteger {
+            0
         }
     }
 );
@@ -757,6 +986,19 @@ impl TimerTarget {
 
 fn cast_any_object<T: ?Sized>(obj: &T) -> &AnyObject {
     unsafe { &*(obj as *const T as *const AnyObject) }
+}
+
+fn ns_object_to_string(obj: &AnyObject) -> Option<String> {
+    autoreleasepool(|pool| {
+        if let Some(string) = obj.downcast_ref::<NSString>() {
+            return Some(unsafe { string.to_str(pool).to_string() });
+        }
+        if let Some(string) = obj.downcast_ref::<NSAttributedString>() {
+            let ns = string.string();
+            return Some(unsafe { ns.to_str(pool).to_string() });
+        }
+        None
+    })
 }
 
 
