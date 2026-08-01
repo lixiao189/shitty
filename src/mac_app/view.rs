@@ -2,6 +2,7 @@ use crate::terminal::color::{Color32, SELECTION_BG};
 use crate::terminal::grid::{CellPos, TerminalGrid};
 use crate::terminal::keymap;
 use crate::terminal::pty::PtyEvent;
+use crate::terminal::resize::ResizeDebouncer;
 use crate::terminal::selection::Selection;
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{AnyObject, Bool, ProtocolObject, Sel};
@@ -36,6 +37,7 @@ pub(super) struct TerminalViewState {
     had_composition: bool,
     skip_next_command: bool,
     selection: Option<Selection>,
+    resize_debouncer: ResizeDebouncer,
 }
 
 impl TerminalViewState {
@@ -59,6 +61,7 @@ impl TerminalViewState {
             had_composition: false,
             skip_next_command: false,
             selection: None,
+            resize_debouncer: ResizeDebouncer::new(),
         }
     }
 
@@ -68,11 +71,13 @@ impl TerminalViewState {
         }
     }
 
-    fn send_resize(&self, cols: usize, rows: usize) {
-        let _ = self.tx_input.send(PtyEvent::Resize {
-            cols: cols as u16,
-            rows: rows as u16,
-        });
+    fn send_resize(&mut self, cols: usize, rows: usize) {
+        if self.resize_debouncer.mark_sent((cols, rows)) {
+            let _ = self.tx_input.send(PtyEvent::Resize {
+                cols: cols as u16,
+                rows: rows as u16,
+            });
+        }
     }
 
     /// Copy/clear shortcuts that belong to the selection. Returns true when
@@ -163,7 +168,7 @@ define_class!(
         #[unsafe(method(setFrameSize:))]
         fn set_frame_size(&self, new_size: NSSize) {
             let _: () = unsafe { msg_send![super(self), setFrameSize: new_size] };
-            self.update_grid_for_size(new_size);
+            self.record_grid_size(new_size);
         }
 
         #[unsafe(method(mouseDown:))]
@@ -526,11 +531,14 @@ impl ShittyTerminalView {
                 state.timer = Some(timer);
             }
         }
-        view.update_grid_for_size(view.bounds().size);
+        view.record_grid_size(view.bounds().size);
         view
     }
 
-    fn update_grid_for_size(&self, size: NSSize) {
+    /// Record a window size change. The grid and PTY are resized together on
+    /// the render timer once the size has been stable, so the shell's redraw
+    /// is always processed at the width it was generated for.
+    fn record_grid_size(&self, size: NSSize) {
         let state_ptr = self.ivars().state;
         if state_ptr.is_null() {
             return;
@@ -538,11 +546,17 @@ impl ShittyTerminalView {
         let state = unsafe { &mut *state_ptr };
         let cols = ((size.width / state.cell_width).floor() as usize).max(1);
         let rows = ((size.height / state.cell_height).floor() as usize).max(1);
-        if !state.grid.resize(cols, rows) {
-            return;
+        if state.resize_debouncer.record(cols, rows) {
+            // The very first size is applied right away so the shell starts
+            // with a sane terminal size; there is no prior redraw to race.
+            if !state.resize_debouncer.has_sent()
+                && let Some((cols, rows)) = state.resize_debouncer.take_now()
+                && state.grid.resize(cols, rows)
+            {
+                state.send_resize(cols, rows);
+            }
+            self.setNeedsDisplay(true);
         }
-        state.send_resize(cols, rows);
-        self.setNeedsDisplay(true);
     }
 
     /// Convert a mouse event into a snapped grid cell.
@@ -594,6 +608,9 @@ define_class!(
             }
             let state = unsafe { &mut *state_ptr };
 
+            // Drain pending output before resizing: bytes written for the
+            // current width must be processed at that width, otherwise a
+            // shell redraw can wrap at a smaller grid and leave duplicates.
             let mut received_data = false;
             while let Ok(bytes) = state.rx_output.try_recv() {
                 state.grid.process_pty_bytes(&bytes);
@@ -603,10 +620,25 @@ define_class!(
             if received_data {
                 // The grid contents changed, so a stale highlight no longer matches.
                 state.selection = None;
-                if state.grid.has_changes() {
-                    self.ivars().view.setNeedsDisplay(true);
-                    state.grid.mark_rendered();
+            }
+
+            // Apply a debounced resize once the drag settles: the grid and
+            // PTY move together, so the shell only redraws once at the final
+            // size and that redraw is processed at the matching width.
+            if let Some((cols, rows)) = state.resize_debouncer.take_stable() {
+                if state.grid.resize(cols, rows) {
+                    state.send_resize(cols, rows);
+                    // The grid geometry changed, so the selection no longer fits.
+                    state.selection = None;
+                } else {
+                    // Grid already at this size; make sure the PTY knows too.
+                    state.send_resize(cols, rows);
                 }
+            }
+
+            if state.grid.has_changes() {
+                self.ivars().view.setNeedsDisplay(true);
+                state.grid.mark_rendered();
             }
         }
     }

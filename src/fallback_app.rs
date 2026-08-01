@@ -2,6 +2,7 @@ use crate::terminal::color::SELECTION_BG;
 use crate::terminal::grid::{CellPos, TerminalGrid};
 use crate::terminal::keymap::append_input_from_event;
 use crate::terminal::pty::{Pty, PtyEvent};
+use crate::terminal::resize::ResizeDebouncer;
 use crate::terminal::selection::Selection;
 use eframe::egui::{self, IconData};
 use image::GenericImageView;
@@ -82,6 +83,8 @@ struct TerminalUI {
     cached_cell_size: Option<(f32, f32)>,
     needs_repaint: bool,
     selection: Option<Selection>,
+    resize_debouncer: ResizeDebouncer,
+    resize_pending: bool,
 }
 
 impl TerminalUI {
@@ -94,6 +97,8 @@ impl TerminalUI {
             cached_cell_size: None,
             needs_repaint: false,
             selection: None,
+            resize_debouncer: ResizeDebouncer::new(),
+            resize_pending: false,
         }
     }
 
@@ -111,17 +116,55 @@ impl TerminalUI {
         size
     }
 
-    fn resize_grid(&mut self, available: egui::Vec2, cell_w: f32, cell_h: f32) {
+    /// Record a window size change. The grid and PTY are resized together on a
+    /// later frame once the size has been stable, so the shell's redraw is
+    /// always processed at the width it was generated for.
+    fn record_resize(&mut self, available: egui::Vec2, cell_w: f32, cell_h: f32) {
         let cols = ((available.x / cell_w).floor() as usize).max(1);
         let rows = ((available.y / cell_h).floor() as usize).max(1);
-        if !self.grid.resize(cols, rows) {
+        if !self.resize_debouncer.record(cols, rows) {
             return;
         }
-        let _ = self.tx_pty_input.send(PtyEvent::Resize {
-            cols: cols as u16,
-            rows: rows as u16,
-        });
+        // The very first size is applied right away so the shell starts with a
+        // sane terminal size; there is no prior redraw to race.
+        if !self.resize_debouncer.has_sent() {
+            if let Some((cols, rows)) = self.resize_debouncer.take_now()
+                && self.grid.resize(cols, rows)
+            {
+                self.send_resize(cols, rows);
+            }
+        } else {
+            self.resize_pending = true;
+        }
         self.needs_repaint = true;
+    }
+
+    /// Apply a debounced resize once the drag settles. Must run after
+    /// [`Self::drain_pty_output`] so output written at the current width is
+    /// processed before the grid and PTY move to the new size.
+    fn apply_pending_resize(&mut self) {
+        let Some((cols, rows)) = self.resize_debouncer.take_stable() else {
+            return;
+        };
+        self.resize_pending = false;
+        if self.grid.resize(cols, rows) {
+            self.send_resize(cols, rows);
+            // The grid geometry changed, so the selection no longer fits.
+            self.selection = None;
+        } else {
+            // Grid already at this size; make sure the PTY knows too.
+            self.send_resize(cols, rows);
+        }
+        self.needs_repaint = true;
+    }
+
+    fn send_resize(&mut self, cols: usize, rows: usize) {
+        if self.resize_debouncer.mark_sent((cols, rows)) {
+            let _ = self.tx_pty_input.send(PtyEvent::Resize {
+                cols: cols as u16,
+                rows: rows as u16,
+            });
+        }
     }
 
     fn drain_pty_output(&mut self) {
@@ -356,15 +399,16 @@ impl eframe::App for TerminalUI {
             .frame(egui::Frame::NONE.fill(self.grid.default_bg().into()))
             .show(ctx, |ui| {
                 let (cell_w, cell_h) = self.cell_size(ctx);
-                self.resize_grid(ui.available_size(), cell_w, cell_h);
+                self.record_resize(ui.available_size(), cell_w, cell_h);
                 self.drain_pty_output();
+                self.apply_pending_resize();
                 self.send_input_events(ctx);
                 self.paint(ui, cell_w, cell_h);
 
                 self.grid.mark_rendered();
             });
 
-        if self.needs_repaint {
+        if self.needs_repaint || self.resize_pending {
             ctx.request_repaint();
             self.needs_repaint = false;
         }

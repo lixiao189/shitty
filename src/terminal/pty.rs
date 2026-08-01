@@ -62,6 +62,9 @@ impl Pty {
         });
 
         thread::spawn(move || {
+            // The last size applied to the PTY, so repeated/coalesced resize
+            // events do not spam the shell with redundant SIGWINCH redraws.
+            let mut last_resize: Option<(u16, u16)> = None;
             while let Ok(event) = rx_input.recv() {
                 match event {
                     PtyEvent::Input(bytes) => {
@@ -70,7 +73,30 @@ impl Pty {
                         }
                     }
                     PtyEvent::Resize { cols, rows } => {
-                        apply_resize(master_write.as_raw_fd(), cols, rows, shell_pgid);
+                        // Coalesce resize events that are already queued: only
+                        // the latest size matters, while any input between them
+                        // is still applied, in order.
+                        let mut cols = cols;
+                        let mut rows = rows;
+                        let mut queued_inputs = Vec::new();
+                        while let Ok(event) = rx_input.try_recv() {
+                            match event {
+                                PtyEvent::Resize { cols: c, rows: r } => {
+                                    cols = c;
+                                    rows = r;
+                                }
+                                PtyEvent::Input(bytes) => queued_inputs.push(bytes),
+                            }
+                        }
+                        if last_resize != Some((cols, rows)) {
+                            apply_resize(master_write.as_raw_fd(), cols, rows, shell_pgid);
+                            last_resize = Some((cols, rows));
+                        }
+                        for bytes in queued_inputs {
+                            if write(master_write.as_fd(), &bytes).is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
             }
