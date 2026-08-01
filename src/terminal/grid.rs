@@ -1,5 +1,18 @@
 use crate::terminal::color::{Color32, DEFAULT_BG, DEFAULT_FG, xterm_256_color};
 
+/// A position in the terminal grid; row 0 is the top line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CellPos {
+    pub row: usize,
+    pub col: usize,
+}
+
+impl CellPos {
+    pub(crate) const fn new(row: usize, col: usize) -> Self {
+        Self { row, col }
+    }
+}
+
 pub(crate) struct TerminalGrid {
     parser: vt100::Parser,
     palette: [Option<Color32>; 256],
@@ -87,6 +100,22 @@ impl TerminalGrid {
             wide: cell.is_wide(),
             wide_continuation: cell.is_wide_continuation(),
         })
+    }
+
+    /// Clamp a pointer-derived position into the grid, moving it off the right
+    /// half of a wide character so a selection always spans whole characters.
+    pub(crate) fn snap_cell_pos(&self, pos: CellPos) -> CellPos {
+        let row = pos.row.min(self.rows().saturating_sub(1));
+        let col = pos.col.min(self.cols().saturating_sub(1));
+        let col = if self
+            .get_cell(row, col)
+            .is_some_and(|cell| cell.wide_continuation)
+        {
+            col.saturating_sub(1)
+        } else {
+            col
+        };
+        CellPos::new(row, col)
     }
 
     pub(crate) fn resolve_cell_colors(&self, cell: &CellInfo) -> (Color32, Color32) {

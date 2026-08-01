@@ -12,12 +12,18 @@ impl Color32 {
         Self { r, g, b, a: 255 }
     }
 
+    pub const fn from_rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
+        Self { r, g, b, a }
+    }
+
     pub const BLACK: Self = Self::from_rgb(0, 0, 0);
     pub const WHITE: Self = Self::from_rgb(255, 255, 255);
 }
 
 pub(crate) const DEFAULT_FG: Color32 = Color32::from_rgb(204, 204, 204);
 pub(crate) const DEFAULT_BG: Color32 = Color32::BLACK;
+/// Translucent highlight drawn behind selected cells.
+pub(crate) const SELECTION_BG: Color32 = Color32::from_rgba(70, 110, 220, 110);
 
 // Lookup table for RGB levels used in xterm 256 color mode
 const RGB_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
@@ -67,6 +73,6 @@ pub(crate) fn xterm_256_color(index: u8) -> Color32 {
 #[cfg(not(target_os = "macos"))]
 impl From<Color32> for eframe::egui::Color32 {
     fn from(c: Color32) -> Self {
-        eframe::egui::Color32::from_rgba_premultiplied(c.r, c.g, c.b, c.a)
+        eframe::egui::Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
     }
 }

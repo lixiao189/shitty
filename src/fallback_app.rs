@@ -1,6 +1,8 @@
-use crate::terminal::grid::TerminalGrid;
+use crate::terminal::color::SELECTION_BG;
+use crate::terminal::grid::{CellPos, TerminalGrid};
 use crate::terminal::keymap::append_input_from_event;
 use crate::terminal::pty::{Pty, PtyEvent};
+use crate::terminal::selection::Selection;
 use eframe::egui::{self, IconData};
 use image::GenericImageView;
 use std::fs;
@@ -79,6 +81,7 @@ struct TerminalUI {
     font_id: egui::FontId,
     cached_cell_size: Option<(f32, f32)>,
     needs_repaint: bool,
+    selection: Option<Selection>,
 }
 
 impl TerminalUI {
@@ -90,6 +93,7 @@ impl TerminalUI {
             font_id: egui::FontId::monospace(14.0),
             cached_cell_size: None,
             needs_repaint: false,
+            selection: None,
         }
     }
 
@@ -126,31 +130,137 @@ impl TerminalUI {
             self.grid.process_pty_bytes(&bytes);
             received_data = true;
         }
-        if received_data && self.grid.has_changes() {
-            self.needs_repaint = true;
+        if received_data {
+            // The grid contents changed, so a stale highlight no longer matches.
+            self.selection = None;
+            if self.grid.has_changes() {
+                self.needs_repaint = true;
+            }
         }
     }
 
     fn send_input_events(&mut self, ctx: &egui::Context) {
         let mut input_bytes = Vec::new();
+        let mut selection_changed = false;
         ctx.input(|input| {
             let mods = input.modifiers;
             for event in &input.events {
+                if self.handle_selection_key(event, ctx) {
+                    selection_changed = true;
+                    continue;
+                }
                 append_input_from_event(event, mods, &mut input_bytes);
             }
         });
+        if selection_changed {
+            self.needs_repaint = true;
+        }
         if !input_bytes.is_empty() {
             let _ = self.tx_pty_input.send(PtyEvent::Input(input_bytes));
         }
     }
 
-    fn paint(&self, ui: &mut egui::Ui, cell_w: f32, cell_h: f32) {
+    /// Consume copy/clear shortcuts that belong to the selection instead of
+    /// forwarding them to the shell.
+    fn handle_selection_key(&mut self, event: &egui::Event, ctx: &egui::Context) -> bool {
+        match event {
+            egui::Event::Key {
+                key: egui::Key::Escape,
+                pressed: true,
+                ..
+            } if self.selection.is_some() => {
+                self.selection = None;
+                true
+            }
+            egui::Event::Key {
+                key: egui::Key::C,
+                pressed: true,
+                modifiers,
+                ..
+            } if self.selection.is_some() => {
+                if modifiers.ctrl && modifiers.shift && !modifiers.command {
+                    if let Some(selection) = &self.selection {
+                        let text = selection.selected_text(&self.grid);
+                        if !text.is_empty() {
+                            ctx.copy_text(text);
+                        }
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Start and update the selection from pointer events on the terminal area.
+    fn handle_pointer_selection(
+        &mut self,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        cell_w: f32,
+        cell_h: f32,
+    ) {
+        let mut selection_changed = false;
+        ctx.input(|input| {
+            for event in &input.events {
+                match event {
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        ..
+                    } if rect.contains(*pos) => {
+                        self.selection = Some(Selection::start(
+                            self.cell_at(*pos, rect.min, cell_w, cell_h),
+                        ));
+                        selection_changed = true;
+                    }
+                    egui::Event::PointerMoved(pos) if input.pointer.primary_down() => {
+                        let cell = self.cell_at(*pos, rect.min, cell_w, cell_h);
+                        if let Some(selection) = self.selection.as_mut() {
+                            selection.set_head(cell);
+                            selection_changed = true;
+                        }
+                    }
+                    egui::Event::PointerButton {
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        ..
+                    } if self.selection.is_some() => {
+                        if self.selection.as_ref().is_some_and(|s| s.is_empty()) {
+                            self.selection = None;
+                        }
+                        selection_changed = true;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        if selection_changed {
+            self.needs_repaint = true;
+        }
+    }
+
+    fn cell_at(&self, pos: egui::Pos2, origin: egui::Pos2, cell_w: f32, cell_h: f32) -> CellPos {
+        let row = ((pos.y - origin.y) / cell_h).floor().max(0.0) as usize;
+        let col = ((pos.x - origin.x) / cell_w).floor().max(0.0) as usize;
+        self.grid.snap_cell_pos(CellPos::new(row, col))
+    }
+
+    fn paint(&mut self, ui: &mut egui::Ui, cell_w: f32, cell_h: f32) {
         let (rect, _response) = ui.allocate_at_least(ui.available_size(), egui::Sense::click());
+        self.handle_pointer_selection(ui.ctx(), rect, cell_w, cell_h);
         let painter = ui.painter_at(rect);
         let origin = rect.min;
         let default_bg = self.grid.default_bg();
 
         painter.rect_filled(rect, 0.0, default_bg);
+
+        if let Some(selection) = &self.selection {
+            paint_selection(selection, &painter, &self.grid, origin, cell_w, cell_h);
+        }
 
         for row in 0..self.grid.rows() {
             for run in self.grid.row_runs(row) {
@@ -193,6 +303,36 @@ impl TerminalUI {
                 self.font_id.clone(),
                 cursor.fg.into(),
             );
+        }
+    }
+}
+
+fn paint_selection(
+    selection: &Selection,
+    painter: &egui::Painter,
+    grid: &TerminalGrid,
+    origin: egui::Pos2,
+    cell_w: f32,
+    cell_h: f32,
+) {
+    let color = egui::Color32::from(SELECTION_BG);
+    for row in 0..grid.rows() {
+        let mut col = 0;
+        while col < grid.cols() {
+            if selection.contains(row, col) {
+                let start = col;
+                while col < grid.cols() && selection.contains(row, col) {
+                    col += 1;
+                }
+                let pos = grid_to_screen(origin, cell_w, cell_h, row, start);
+                let rect = egui::Rect::from_min_size(
+                    pos,
+                    egui::vec2(cell_w * (col - start) as f32, cell_h),
+                );
+                painter.rect_filled(rect, 0.0, color);
+            } else {
+                col += 1;
+            }
         }
     }
 }

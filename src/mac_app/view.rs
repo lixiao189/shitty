@@ -1,13 +1,15 @@
-use crate::terminal::color::Color32;
-use crate::terminal::grid::TerminalGrid;
+use crate::terminal::color::{Color32, SELECTION_BG};
+use crate::terminal::grid::{CellPos, TerminalGrid};
 use crate::terminal::keymap;
 use crate::terminal::pty::PtyEvent;
+use crate::terminal::selection::Selection;
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{AnyObject, Bool, ProtocolObject, Sel};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSBezierPath, NSColor, NSEvent, NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
-    NSStringDrawing, NSTextInputClient, NSView,
+    NSBezierPath, NSColor, NSEvent, NSEventModifierFlags, NSFont, NSFontAttributeName,
+    NSForegroundColorAttributeName, NSPasteboard, NSPasteboardTypeString, NSStringDrawing,
+    NSTextInputClient, NSView,
 };
 use objc2_foundation::{
     NSArray, NSAttributedString, NSAttributedStringKey, NSDictionary, NSMutableDictionary,
@@ -33,6 +35,7 @@ pub(super) struct TerminalViewState {
     ime_composing: bool,
     had_composition: bool,
     skip_next_command: bool,
+    selection: Option<Selection>,
 }
 
 impl TerminalViewState {
@@ -55,6 +58,7 @@ impl TerminalViewState {
             ime_composing: false,
             had_composition: false,
             skip_next_command: false,
+            selection: None,
         }
     }
 
@@ -69,6 +73,48 @@ impl TerminalViewState {
             cols: cols as u16,
             rows: rows as u16,
         });
+    }
+
+    /// Copy/clear shortcuts that belong to the selection. Returns true when
+    /// the event was consumed instead of being sent to the shell.
+    fn handle_selection_key(&mut self, event: &NSEvent) -> bool {
+        let characters = event
+            .charactersIgnoringModifiers()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        if characters.eq_ignore_ascii_case("c")
+            && event
+                .modifierFlags()
+                .contains(NSEventModifierFlags::Command)
+            && self.selection.is_some()
+        {
+            self.copy_selection();
+            return true;
+        }
+
+        if characters == "\u{1b}" && self.selection.is_some() {
+            self.selection = None;
+            return true;
+        }
+
+        false
+    }
+
+    fn copy_selection(&self) {
+        let Some(selection) = &self.selection else {
+            return;
+        };
+        let text = selection.selected_text(&self.grid);
+        if text.is_empty() {
+            return;
+        }
+        let pasteboard = NSPasteboard::generalPasteboard();
+        pasteboard.clearContents();
+        let ns_text = NSString::from_str(&text);
+        unsafe {
+            pasteboard.setString_forType(&ns_text, NSPasteboardTypeString);
+        }
     }
 
     fn cursor_cell_rect(&self, bounds: NSRect) -> NSRect {
@@ -120,10 +166,51 @@ define_class!(
             self.update_grid_for_size(new_size);
         }
 
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, event: &NSEvent) {
+            let state_ptr = self.ivars().state;
+            let Some(state) = (unsafe { state_ptr.as_mut() }) else {
+                return;
+            };
+            state.selection = Some(Selection::start(self.cell_at_event(event)));
+            if let Some(window) = self.window() {
+                window.makeFirstResponder(Some(self));
+            }
+            self.setNeedsDisplay(true);
+        }
+
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, event: &NSEvent) {
+            let state_ptr = self.ivars().state;
+            let Some(state) = (unsafe { state_ptr.as_mut() }) else {
+                return;
+            };
+            if let Some(selection) = state.selection.as_mut() {
+                selection.set_head(self.cell_at_event(event));
+                self.setNeedsDisplay(true);
+            }
+        }
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, _event: &NSEvent) {
+            let state_ptr = self.ivars().state;
+            let Some(state) = (unsafe { state_ptr.as_mut() }) else {
+                return;
+            };
+            if state.selection.as_ref().is_some_and(|s| s.is_empty()) {
+                state.selection = None;
+                self.setNeedsDisplay(true);
+            }
+        }
+
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
             let state_ptr = self.ivars().state;
             if let Some(state) = unsafe { state_ptr.as_mut() } {
+                if state.handle_selection_key(event) {
+                    self.setNeedsDisplay(true);
+                    return;
+                }
                 state.had_composition = state.ime_composing;
                 state.marked_text.clear();
                 state.skip_next_command = false;
@@ -150,6 +237,10 @@ define_class!(
 
             to_nscolor(default_bg).set();
             NSBezierPath::fillRect(bounds);
+
+            if let Some(selection) = &state.selection {
+                paint_selection_overlay(state, selection, bounds, scale);
+            }
 
             for row in 0..state.grid.rows() {
                 for run in state.grid.row_runs(row) {
@@ -453,6 +544,23 @@ impl ShittyTerminalView {
         state.send_resize(cols, rows);
         self.setNeedsDisplay(true);
     }
+
+    /// Convert a mouse event into a snapped grid cell.
+    fn cell_at_event(&self, event: &NSEvent) -> CellPos {
+        let state_ptr = self.ivars().state;
+        let Some(state) = (unsafe { state_ptr.as_ref() }) else {
+            return CellPos::new(0, 0);
+        };
+        let bounds = self.bounds();
+        let location = self.convertPoint_fromView(event.locationInWindow(), None);
+        let x = (location.x - bounds.origin.x).max(0.0);
+        let y = (bounds.size.height - (location.y - bounds.origin.y)).max(0.0);
+        let pos = CellPos::new(
+            (y / state.cell_height) as usize,
+            (x / state.cell_width) as usize,
+        );
+        state.grid.snap_cell_pos(pos)
+    }
 }
 
 pub(super) struct TerminalViewIvars {
@@ -492,9 +600,13 @@ define_class!(
                 received_data = true;
             }
 
-            if received_data && state.grid.has_changes() {
-                self.ivars().view.setNeedsDisplay(true);
-                state.grid.mark_rendered();
+            if received_data {
+                // The grid contents changed, so a stale highlight no longer matches.
+                state.selection = None;
+                if state.grid.has_changes() {
+                    self.ivars().view.setNeedsDisplay(true);
+                    state.grid.mark_rendered();
+                }
             }
         }
     }
@@ -530,6 +642,50 @@ fn text_attributes(
         )
     };
     attrs
+}
+
+fn paint_selection_overlay(
+    state: &TerminalViewState,
+    selection: &Selection,
+    bounds: NSRect,
+    scale: f64,
+) {
+    let color = NSColor::colorWithSRGBRed_green_blue_alpha(
+        SELECTION_BG.r as f64 / 255.0,
+        SELECTION_BG.g as f64 / 255.0,
+        SELECTION_BG.b as f64 / 255.0,
+        SELECTION_BG.a as f64 / 255.0,
+    );
+    color.set();
+    for row in 0..state.grid.rows() {
+        let mut col = 0;
+        while col < state.grid.cols() {
+            if selection.contains(row, col) {
+                let start_col = col;
+                while col < state.grid.cols() && selection.contains(row, col) {
+                    col += 1;
+                }
+                let x0 =
+                    snap_to_pixel(bounds.origin.x + start_col as f64 * state.cell_width, scale);
+                let x1 = snap_to_pixel(bounds.origin.x + col as f64 * state.cell_width, scale);
+                let y0 = snap_to_pixel(
+                    bounds.origin.y + bounds.size.height - ((row + 1) as f64 * state.cell_height),
+                    scale,
+                );
+                let y1 = snap_to_pixel(
+                    bounds.origin.y + bounds.size.height - (row as f64 * state.cell_height),
+                    scale,
+                );
+                let rect = NSRect::new(
+                    NSPoint::new(x0, y0),
+                    NSSize::new((x1 - x0).max(0.0), (y1 - y0).max(0.0)),
+                );
+                NSBezierPath::fillRect(rect);
+            } else {
+                col += 1;
+            }
+        }
+    }
 }
 
 fn ns_object_to_string(obj: &AnyObject) -> Option<String> {
