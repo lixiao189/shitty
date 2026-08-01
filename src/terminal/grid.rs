@@ -5,7 +5,6 @@ pub(crate) struct TerminalGrid {
     palette: [Option<Color32>; 256],
     default_fg: Color32,
     default_bg: Color32,
-    cursor_color: Option<Color32>,
     has_changes: bool,
 }
 
@@ -18,17 +17,14 @@ impl TerminalGrid {
             palette: [None; 256],
             default_fg: DEFAULT_FG,
             default_bg: DEFAULT_BG,
-            cursor_color: None,
             has_changes: false,
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn rows(&self) -> usize {
         self.parser.screen().size().0 as usize // size() returns (rows, cols)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn cols(&self) -> usize {
         self.parser.screen().size().1 as usize // size() returns (rows, cols)
     }
@@ -39,10 +35,6 @@ impl TerminalGrid {
 
     pub(crate) fn cursor_visible(&self) -> bool {
         !self.parser.screen().hide_cursor()
-    }
-
-    pub(crate) fn cursor_color(&self) -> Option<Color32> {
-        self.cursor_color
     }
 
     pub(crate) fn cursor_pos(&self) -> (usize, usize) {
@@ -106,6 +98,92 @@ impl TerminalGrid {
         (fg, bg)
     }
 
+    /// Render-ready runs for `row`, tiling the whole row from column 0 to `cols()`.
+    /// Adjacent cells with identical style are merged, and the right halves of
+    /// wide characters are folded into their wide run, so renderers can paint
+    /// each run with a single draw call.
+    pub(crate) fn row_runs(&self, row: usize) -> Vec<CellRun> {
+        let mut runs: Vec<CellRun> = Vec::new();
+        let mut col = 0;
+        while col < self.cols() {
+            let run = match self.get_cell(row, col) {
+                Some(cell) if !cell.wide_continuation => {
+                    let (fg, bg) = self.resolve_cell_colors(&cell);
+                    CellRun {
+                        col,
+                        width: if cell.wide { 2 } else { 1 },
+                        text: cell.text,
+                        fg,
+                        bg,
+                        underline: cell.underline,
+                    }
+                }
+                // Right half of a wide character: already covered by the wide run.
+                Some(_) => {
+                    col += 1;
+                    continue;
+                }
+                None => CellRun {
+                    col,
+                    width: 1,
+                    text: String::new(),
+                    fg: self.default_fg,
+                    bg: self.default_bg,
+                    underline: false,
+                },
+            };
+
+            let width = run.width;
+            if let Some(prev) = runs.last_mut()
+                && prev.fg == run.fg
+                && prev.bg == run.bg
+                && prev.underline == run.underline
+                && prev.col + prev.width == run.col
+                // Never merge across content boundaries: a text run must not
+                // absorb blank cells (or vice versa), otherwise distant text
+                // would collapse into a single run drawn at the wrong column.
+                && prev.text.is_empty() == run.text.is_empty()
+            {
+                prev.text.push_str(&run.text);
+                prev.width += run.width;
+            } else {
+                runs.push(run);
+            }
+            col += width;
+        }
+        runs
+    }
+
+    /// Cursor position and colors, resolved for direct drawing.
+    pub(crate) fn cursor(&self) -> Option<CursorInfo> {
+        if !self.cursor_visible() {
+            return None;
+        }
+        let (row, col) = self.cursor_pos();
+        let (text, cell_fg, cell_bg) = match self.get_cell(row, col) {
+            Some(cell) => {
+                let (fg, bg) = self.resolve_cell_colors(&cell);
+                (cell.text, fg, bg)
+            }
+            None => (String::new(), Color32::WHITE, self.default_bg),
+        };
+        // Solid-block cursor: paint with the cell foreground, falling back to
+        // white when foreground and background are indistinguishable.
+        let bg = if cell_fg == cell_bg {
+            Color32::WHITE
+        } else {
+            cell_fg
+        };
+        let fg = if bg == cell_bg { cell_fg } else { cell_bg };
+        Some(CursorInfo {
+            row,
+            col,
+            text,
+            fg,
+            bg,
+        })
+    }
+
     fn resolve_color(&self, color: vt100::Color, is_fg: bool) -> Color32 {
         match color {
             vt100::Color::Default => {
@@ -136,4 +214,98 @@ pub(crate) struct CellInfo {
     pub inverse: bool,
     pub wide: bool,
     pub wide_continuation: bool,
+}
+
+/// A horizontal run of same-styled cells, ready to be painted by a renderer.
+#[derive(Clone)]
+pub(crate) struct CellRun {
+    pub col: usize,
+    /// Width in terminal columns (2 for wide characters).
+    pub width: usize,
+    pub text: String,
+    pub fg: Color32,
+    pub bg: Color32,
+    pub underline: bool,
+}
+
+/// Fully resolved cursor style, ready to be painted by a renderer.
+#[derive(Clone)]
+pub(crate) struct CursorInfo {
+    pub row: usize,
+    pub col: usize,
+    pub text: String,
+    pub fg: Color32,
+    pub bg: Color32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn row_runs_merges_adjacent_cells_with_the_same_style() {
+        let mut grid = TerminalGrid::new(8, 1);
+        grid.process_pty_bytes(b"ab");
+        let runs = grid.row_runs(0);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].col, 0);
+        assert_eq!(runs[0].width, 2);
+        assert_eq!(runs[0].text, "ab");
+        assert!(runs[1].text.is_empty());
+    }
+
+    #[test]
+    fn row_runs_splits_runs_with_different_styles() {
+        let mut grid = TerminalGrid::new(6, 1);
+        grid.process_pty_bytes(b"\x1b[31mred\x1b[0m");
+        let runs = grid.row_runs(0);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].text, "red");
+        assert_eq!(runs[0].fg, Color32::from_rgb(128, 0, 0));
+        assert_eq!(runs[0].width, 3);
+        assert_eq!(runs[1].text, "");
+        assert_eq!(runs[1].width, 3);
+    }
+
+    #[test]
+    fn row_runs_folds_wide_character_continuations() {
+        let mut grid = TerminalGrid::new(4, 1);
+        grid.process_pty_bytes("文".as_bytes());
+        let runs = grid.row_runs(0);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].text, "文");
+        assert_eq!(runs[0].width, 2);
+        assert!(runs[1].text.is_empty());
+    }
+
+    #[test]
+    fn row_runs_keeps_distant_text_separate_across_blank_cells() {
+        let mut grid = TerminalGrid::new(10, 1);
+        grid.process_pty_bytes(b" \x1b[6Gat");
+        let runs = grid.row_runs(0);
+        // The trailing space (col 0) and the text at col 5 must not merge
+        // across the blank cells in between.
+        assert_eq!(runs[0].col, 0);
+        assert_eq!(runs[0].text, " ");
+        let at_run = runs.iter().find(|r| r.text == "at").expect("at run");
+        assert_eq!(at_run.col, 5);
+        assert_eq!(at_run.width, 2);
+        // Blank cells sit between the two runs.
+        assert!(runs.iter().any(|r| r.text.is_empty()));
+    }
+
+    #[test]
+    fn cursor_reports_position() {
+        let mut grid = TerminalGrid::new(8, 2);
+        grid.process_pty_bytes(b"\x1b[2;3H");
+        let cursor = grid.cursor().expect("cursor should be visible");
+        assert_eq!((cursor.row, cursor.col), (1, 2));
+    }
+
+    #[test]
+    fn cursor_is_hidden_when_asked() {
+        let mut grid = TerminalGrid::new(4, 1);
+        grid.process_pty_bytes(b"\x1b[?25l");
+        assert!(grid.cursor().is_none());
+    }
 }

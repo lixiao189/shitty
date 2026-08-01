@@ -1,39 +1,19 @@
-use eframe::egui::{self};
-use egui::IconData;
-use image::GenericImageView;
-use nix::pty::openpty;
-use nix::unistd::{read, write};
-use std::fs;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-use std::sync::Arc;
-use std::sync::mpsc::{Receiver, Sender, channel};
-use std::thread;
-
 use crate::terminal::grid::TerminalGrid;
 use crate::terminal::keymap::append_input_from_event;
-use crate::terminal::pty::{PtyEvent, apply_resize};
+use crate::terminal::pty::{Pty, PtyEvent};
+use eframe::egui::{self, IconData};
+use image::GenericImageView;
+use std::fs;
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let pty_result = openpty(None, None)?;
-    let master_fd = pty_result.master;
-    let slave_fd = pty_result.slave;
-    let shell_pgid = crate::terminal::pty::spawn_shell(&slave_fd);
-
-    let icon_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icon.png");
-    let icon_data = if let Ok(img) = image::open(&icon_path) {
-        let rgba = img.to_rgba8();
-        let (width, height) = img.dimensions();
-        Some(Arc::new(IconData {
-            rgba: rgba.into_raw(),
-            width,
-            height,
-        }))
-    } else {
-        None
-    };
+    let pty = Pty::spawn()?;
+    let (tx_pty_output, rx_pty_output) = channel::<Vec<u8>>();
+    let (tx_pty_input, rx_pty_input) = channel::<PtyEvent>();
 
     let mut viewport = egui::ViewportBuilder::default();
-    if let Some(icon) = icon_data {
+    if let Some(icon) = load_icon() {
         viewport = viewport.with_icon(icon);
     }
 
@@ -44,24 +24,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         },
         Box::new(|cc| {
-            configure_visuals(cc);
-            configure_fonts(cc);
+            configure_ui(cc);
 
-            let (tx_pty_output, rx_pty_output) = channel::<Vec<u8>>();
-            let (tx_pty_input, rx_pty_input) = channel::<PtyEvent>();
             let ctx = cc.egui_ctx.clone();
-
-            let master_read = master_fd.try_clone().expect("master fd clone failed");
-            let master_write = master_fd;
-
-            spawn_pty_threads(
-                master_read,
-                master_write,
-                tx_pty_output,
-                rx_pty_input,
-                ctx,
-                shell_pgid,
-            );
+            pty.spawn_threads(tx_pty_output, rx_pty_input, move || ctx.request_repaint());
 
             Ok(Box::new(TerminalUI::new(rx_pty_output, tx_pty_input)))
         }),
@@ -69,75 +35,42 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     .map_err(Into::into)
 }
 
-fn configure_visuals(cc: &eframe::CreationContext<'_>) {
+fn load_icon() -> Option<Arc<IconData>> {
+    let icon_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icon.png");
+    let img = image::open(&icon_path).ok()?;
+    let rgba = img.to_rgba8();
+    let (width, height) = img.dimensions();
+    Some(Arc::new(IconData {
+        rgba: rgba.into_raw(),
+        width,
+        height,
+    }))
+}
+
+fn configure_ui(cc: &eframe::CreationContext<'_>) {
     cc.egui_ctx.set_visuals(egui::Visuals::dark());
     cc.egui_ctx.style_mut(|style| {
         style.visuals.panel_fill = egui::Color32::BLACK;
     });
+    load_terminal_font(cc);
 }
 
-fn configure_fonts(cc: &eframe::CreationContext<'_>) {
+fn load_terminal_font(cc: &eframe::CreationContext<'_>) {
     let font_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("assets/MonacoNerdFontMono-Regular.ttf");
-    if let Ok(font_data) = fs::read(&font_path) {
-        let mut fonts = egui::FontDefinitions::default();
-        fonts.font_data.insert(
-            "monaco".to_string(),
-            egui::FontData::from_owned(font_data).into(),
-        );
-        fonts
-            .families
-            .insert(egui::FontFamily::Monospace, vec!["monaco".to_string()]);
-        cc.egui_ctx.set_fonts(fonts);
-    }
+    let Ok(font_data) = fs::read(&font_path) else {
+        return;
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "monaco".to_string(),
+        egui::FontData::from_owned(font_data).into(),
+    );
+    fonts
+        .families
+        .insert(egui::FontFamily::Monospace, vec!["monaco".to_string()]);
+    cc.egui_ctx.set_fonts(fonts);
 }
-
-
-
-// PtyEvent carries both input bytes and resize signals; ctx.request_repaint()
-// wakes the egui loop whenever new PTY output arrives.
-fn spawn_pty_threads(
-    master_read: OwnedFd,
-    master_write: OwnedFd,
-    tx_pty_output: Sender<Vec<u8>>,
-    rx_pty_input: Receiver<PtyEvent>,
-    ctx: egui::Context,
-    shell_pgid: i32,
-) {
-    thread::spawn(move || {
-        loop {
-            let mut buffer = [0u8; 8192];
-            match read(master_read.as_fd(), &mut buffer) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if tx_pty_output.send(buffer[..n].to_vec()).is_err() {
-                        break;
-                    }
-                    ctx.request_repaint();
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    thread::spawn(move || {
-        while let Ok(event) = rx_pty_input.recv() {
-            match event {
-                PtyEvent::Input(bytes) => {
-                    if write(master_write.as_fd(), &bytes).is_err() {
-                        break;
-                    }
-                }
-                PtyEvent::Resize { cols, rows } => {
-                    apply_resize(master_write.as_raw_fd(), cols, rows, shell_pgid);
-                }
-            }
-        }
-    });
-}
-
-// Convert terminal Color32 to egui Color32
-
 
 struct TerminalUI {
     rx_pty_output: Receiver<Vec<u8>>,
@@ -145,6 +78,7 @@ struct TerminalUI {
     grid: TerminalGrid,
     font_id: egui::FontId,
     cached_cell_size: Option<(f32, f32)>,
+    needs_repaint: bool,
 }
 
 impl TerminalUI {
@@ -155,6 +89,7 @@ impl TerminalUI {
             grid: TerminalGrid::new(80, 24),
             font_id: egui::FontId::monospace(14.0),
             cached_cell_size: None,
+            needs_repaint: false,
         }
     }
 
@@ -170,6 +105,95 @@ impl TerminalUI {
         });
         self.cached_cell_size = Some(size);
         size
+    }
+
+    fn resize_grid(&mut self, available: egui::Vec2, cell_w: f32, cell_h: f32) {
+        let cols = ((available.x / cell_w).floor() as usize).max(1);
+        let rows = ((available.y / cell_h).floor() as usize).max(1);
+        if !self.grid.resize(cols, rows) {
+            return;
+        }
+        let _ = self.tx_pty_input.send(PtyEvent::Resize {
+            cols: cols as u16,
+            rows: rows as u16,
+        });
+        self.needs_repaint = true;
+    }
+
+    fn drain_pty_output(&mut self) {
+        let mut received_data = false;
+        while let Ok(bytes) = self.rx_pty_output.try_recv() {
+            self.grid.process_pty_bytes(&bytes);
+            received_data = true;
+        }
+        if received_data && self.grid.has_changes() {
+            self.needs_repaint = true;
+        }
+    }
+
+    fn send_input_events(&mut self, ctx: &egui::Context) {
+        let mut input_bytes = Vec::new();
+        ctx.input(|input| {
+            let mods = input.modifiers;
+            for event in &input.events {
+                append_input_from_event(event, mods, &mut input_bytes);
+            }
+        });
+        if !input_bytes.is_empty() {
+            let _ = self.tx_pty_input.send(PtyEvent::Input(input_bytes));
+        }
+    }
+
+    fn paint(&self, ui: &mut egui::Ui, cell_w: f32, cell_h: f32) {
+        let (rect, _response) = ui.allocate_at_least(ui.available_size(), egui::Sense::click());
+        let painter = ui.painter_at(rect);
+        let origin = rect.min;
+        let default_bg = self.grid.default_bg();
+
+        painter.rect_filled(rect, 0.0, default_bg);
+
+        for row in 0..self.grid.rows() {
+            for run in self.grid.row_runs(row) {
+                let pos = grid_to_screen(origin, cell_w, cell_h, row, run.col);
+                let run_rect =
+                    egui::Rect::from_min_size(pos, egui::vec2(cell_w * run.width as f32, cell_h));
+
+                if run.bg != default_bg {
+                    painter.rect_filled(run_rect, 0.0, run.bg);
+                }
+
+                if !run.text.is_empty() && !run.text.trim().is_empty() {
+                    painter.text(
+                        pos,
+                        egui::Align2::LEFT_TOP,
+                        &run.text,
+                        self.font_id.clone(),
+                        run.fg.into(),
+                    );
+                }
+
+                if run.underline {
+                    let underline_rect = egui::Rect::from_min_size(
+                        egui::pos2(pos.x, pos.y + cell_h - 1.0),
+                        egui::vec2(cell_w * run.width as f32, 1.0),
+                    );
+                    painter.rect_filled(underline_rect, 0.0, run.fg);
+                }
+            }
+        }
+
+        if let Some(cursor) = self.grid.cursor() {
+            let pos = grid_to_screen(origin, cell_w, cell_h, cursor.row, cursor.col);
+            let cursor_rect = egui::Rect::from_min_size(pos, egui::vec2(cell_w, cell_h));
+            painter.rect_filled(cursor_rect, 0.0, cursor.bg);
+            painter.text(
+                pos,
+                egui::Align2::LEFT_TOP,
+                &cursor.text,
+                self.font_id.clone(),
+                cursor.fg.into(),
+            );
+        }
     }
 }
 
@@ -188,155 +212,21 @@ fn grid_to_screen(
 
 impl eframe::App for TerminalUI {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let mut needs_repaint = false;
-
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(self.grid.default_bg().into()))
             .show(ctx, |ui| {
                 let (cell_w, cell_h) = self.cell_size(ctx);
-                let available = ui.available_size();
-                let cols = ((available.x / cell_w).floor() as usize).max(1);
-                let rows = ((available.y / cell_h).floor() as usize).max(1);
-
-                if self.grid.resize(cols, rows) {
-                    let _ = self.tx_pty_input.send(PtyEvent::Resize {
-                        cols: cols as u16,
-                        rows: rows as u16,
-                    });
-                    needs_repaint = true;
-                }
-
-                let mut received_data = false;
-                while let Ok(bytes) = self.rx_pty_output.try_recv() {
-                    self.grid.process_pty_bytes(&bytes);
-                    received_data = true;
-                }
-
-                if received_data && self.grid.has_changes() {
-                    needs_repaint = true;
-                }
-
-                let (rect, _response) = ui.allocate_at_least(available, egui::Sense::click());
-
-                let mut input_bytes = Vec::new();
-                ctx.input(|input| {
-                    let mods = input.modifiers;
-                    for event in &input.events {
-                        append_input_from_event(event, mods, &mut input_bytes);
-                    }
-                });
-                if !input_bytes.is_empty() {
-                    let _ = self.tx_pty_input.send(PtyEvent::Input(input_bytes));
-                }
-
-                let painter = ui.painter_at(rect);
-                let origin = rect.min;
-
-                painter.rect_filled(rect, 0.0, self.grid.default_bg().into());
-
-                let default_bg = self.grid.default_bg();
-                let font_id = &self.font_id;
-
-                for row in 0..rows {
-                    let mut col = 0;
-                    while col < cols {
-                        let cell = self.grid.get_cell(row, col);
-
-                        if cell.as_ref().is_some_and(|c| c.wide_continuation) {
-                            col += 1;
-                            continue;
-                        }
-
-                        let (text, fg, bg, underline, col_span) = if let Some(cell) = &cell {
-                            let (fg, bg) = self.grid.resolve_cell_colors(cell);
-                            let span = if cell.wide { 2 } else { 1 };
-                            (cell.text.as_str(), fg, bg, cell.underline, span)
-                        } else {
-                            (
-                                "",
-                                crate::terminal::color::Color32::WHITE,
-                                default_bg,
-                                false,
-                                1,
-                            )
-                        };
-
-                        let pos = grid_to_screen(origin, cell_w, cell_h, row, col);
-                        let rect = egui::Rect::from_min_size(
-                            pos,
-                            egui::vec2(cell_w * col_span as f32, cell_h),
-                        );
-
-                        if bg != default_bg {
-                            painter.rect_filled(rect, 0.0, bg.into());
-                        }
-
-                        if !text.is_empty() && text != " " {
-                            painter.text(
-                                pos,
-                                egui::Align2::LEFT_TOP,
-                                text,
-                                font_id.clone(),
-                                fg.into(),
-                            );
-                        }
-
-                        if underline {
-                            let y = pos.y + cell_h - 1.0;
-                            let underline_rect = egui::Rect::from_min_size(
-                                egui::pos2(pos.x, y),
-                                egui::vec2(cell_w * col_span as f32, 1.0),
-                            );
-                            painter.rect_filled(underline_rect, 0.0, fg.into());
-                        }
-
-                        col += col_span;
-                    }
-                }
-
-                if self.grid.cursor_visible() {
-                    let (cursor_row, cursor_col) = self.grid.cursor_pos();
-                    let cursor_cell = self.grid.get_cell(cursor_row, cursor_col);
-                    let (cell_fg, cell_bg) = cursor_cell
-                        .as_ref()
-                        .map(|cell| self.grid.resolve_cell_colors(cell))
-                        .unwrap_or((
-                            crate::terminal::color::Color32::WHITE,
-                            self.grid.default_bg(),
-                        ));
-                    let cursor_pos = grid_to_screen(origin, cell_w, cell_h, cursor_row, cursor_col);
-                    let cursor_rect =
-                        egui::Rect::from_min_size(cursor_pos, egui::vec2(cell_w, cell_h));
-                    let cursor_bg = self.grid.cursor_color().unwrap_or_else(|| {
-                        if cell_fg == cell_bg {
-                            crate::terminal::color::Color32::WHITE
-                        } else {
-                            cell_fg
-                        }
-                    });
-                    let cursor_fg = if cursor_bg == cell_bg {
-                        cell_fg
-                    } else {
-                        cell_bg
-                    };
-                    painter.rect_filled(cursor_rect, 0.0, cursor_bg.into());
-                    painter.text(
-                        cursor_pos,
-                        egui::Align2::LEFT_TOP,
-                        cursor_cell
-                            .as_ref()
-                            .map(|cell| cell.text.as_str())
-                            .unwrap_or(" "),
-                        font_id.clone(),
-                        cursor_fg.into(),
-                    );
-                }
+                self.resize_grid(ui.available_size(), cell_w, cell_h);
+                self.drain_pty_output();
+                self.send_input_events(ctx);
+                self.paint(ui, cell_w, cell_h);
 
                 self.grid.mark_rendered();
             });
 
-        if needs_repaint {
+        if self.needs_repaint {
             ctx.request_repaint();
+            self.needs_repaint = false;
         }
     }
 }

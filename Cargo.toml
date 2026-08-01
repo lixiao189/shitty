@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 nix = { version = "0.31.1", features = ["term"] }
-unicode-width = "0.2"
 vt100 = "0.15"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]

@@ -86,18 +86,19 @@ flowchart LR
 ## Project Layout
 
 - `src/main.rs`: OS routing (macOS AppKit vs egui).
-- `src/fallback_app.rs`: egui bootstrapping, PTY threads, and font setup.
-- `src/mac_app.rs`: native AppKit window, view, and renderer.
+- `src/fallback_app.rs`: egui UI — bootstrapping, PTY session, and rendering.
+- `src/mac_app/`: native AppKit UI — `app.rs` (bootstrap, menu, window),
+  `view.rs` (terminal view, rendering, IME), `font.rs` (font loading).
 - `src/terminal/mod.rs`: terminal module exports.
 - `src/terminal/grid.rs`: vt100 parser wrapper and grid access.
 - `src/terminal/color.rs`: ANSI/xterm color mapping.
 - `src/terminal/keymap.rs`: key event translation (egui + macOS).
-- `src/terminal/pty.rs`: resize handling and signals.
+- `src/terminal/pty.rs`: PTY session lifecycle, resize handling, and IO threads.
 
 ## Notes
 
 - The egui path drives repaints on PTY output to avoid busy loops.
-- The AppKit path uses an NSTimer to drive render updates at ~60Hz.
+- The AppKit path uses an NSTimer to drive render updates at 120Hz.
 - Resizes propagate through TIOCSWINSZ and SIGWINCH to keep shells happy.
 
 ## Build Requirements
