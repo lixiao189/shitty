@@ -322,6 +322,18 @@ define_class!(
                     self.setNeedsDisplay(true);
                     return;
                 }
+                // Translate Control+key (^C, ^D, ...) straight to control
+                // bytes. Going through interpretKeyEvents: would let
+                // AppKit's key bindings swallow most of them (^D becomes
+                // deleteForward:, ^A/^E/^K/^U/^N/^P/^B/^F/^W/^T/^V become
+                // editing commands), so they'd never reach the shell.
+                if !state.ime_composing
+                    && let Some(bytes) = keymap::control_key_bytes(event)
+                {
+                    state.send_input(bytes);
+                    self.setNeedsDisplay(true);
+                    return;
+                }
                 state.had_composition = state.ime_composing;
                 state.marked_text.clear();
                 state.skip_next_command = false;

@@ -39,15 +39,53 @@ pub mod egui_keymap {
     }
 
     fn ctrl_key_byte(key: egui::Key) -> Option<u8> {
+        if key == egui::Key::Space {
+            return Some(0x00);
+        }
         let name = key.name();
         let bytes = name.as_bytes();
-        if bytes.len() == 1 {
-            let b = bytes[0];
-            if b.is_ascii_uppercase() {
-                return Some(b - b'A' + 1);
-            }
+        let [b] = bytes else {
+            return None;
+        };
+        match b {
+            b'A'..=b'Z' => Some(b - b'A' + 1),
+            b'a'..=b'z' => Some(b - b'a' + 1),
+            b'[' => Some(0x1b),
+            b'\\' => Some(0x1c),
+            b']' => Some(0x1d),
+            b'^' => Some(0x1e),
+            b'_' => Some(0x1f),
+            b'@' => Some(0x00),
+            b' ' => Some(0x00),
+            b'2' => Some(0x00),
+            b'3' => Some(0x1b),
+            b'4' => Some(0x1c),
+            b'5' => Some(0x1d),
+            b'6' => Some(0x1e),
+            b'7' => Some(0x1f),
+            b'8' => Some(0x7f),
+            b'/' => Some(0x1f),
+            _ => None,
         }
-        None
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn ctrl_letters_map_to_control_bytes() {
+            assert_eq!(ctrl_key_byte(egui::Key::C), Some(0x03));
+            assert_eq!(ctrl_key_byte(egui::Key::D), Some(0x04));
+            assert_eq!(ctrl_key_byte(egui::Key::A), Some(0x01));
+            assert_eq!(ctrl_key_byte(egui::Key::Z), Some(0x1a));
+        }
+
+        #[test]
+        fn ctrl_symbol_keys_map_to_control_bytes() {
+            assert_eq!(ctrl_key_byte(egui::Key::Space), Some(0x00));
+            assert_eq!(ctrl_key_byte(egui::Key::OpenBracket), Some(0x1b));
+        }
     }
 
     fn push_key_bytes(key: egui::Key, out: &mut Vec<u8>) -> bool {
@@ -87,6 +125,7 @@ pub mod egui_keymap {
 
 #[cfg(target_os = "macos")]
 pub mod macos_keymap {
+    use objc2_app_kit::{NSEvent, NSEventModifierFlags};
     use objc2::runtime::Sel;
 
     pub(crate) fn append_input_from_selector(selector: Sel, out: &mut Vec<u8>) -> bool {
@@ -121,6 +160,57 @@ pub mod macos_keymap {
         out.extend_from_slice(text.as_bytes());
     }
 
+    /// Map the unmodified character of a key to the control byte the shell
+    /// expects for a Control+key press (^C = 0x03, ^D = 0x04, ^[ = ESC, ...).
+    /// Follows the same table as xterm/Terminal.app for digit and symbol keys.
+    pub(crate) fn control_byte_for_char(c: char) -> Option<u8> {
+        let byte = match c {
+            'a'..='z' => (c as u8) & 0x1f,
+            'A'..='Z' => (c as u8) & 0x1f,
+            '[' => 0x1b,
+            '\\' => 0x1c,
+            ']' => 0x1d,
+            '^' => 0x1e,
+            '_' => 0x1f,
+            '@' => 0x00,
+            ' ' => 0x00,
+            '2' => 0x00,
+            '3' => 0x1b,
+            '4' => 0x1c,
+            '5' => 0x1d,
+            '6' => 0x1e,
+            '7' => 0x1f,
+            '8' => 0x7f,
+            '/' => 0x1f,
+            _ => return None,
+        };
+        Some(byte)
+    }
+
+    /// Translate a Control-modified key event to its raw control byte(s).
+    /// Returns None for events that should keep going through the normal
+    /// text-input path (no Control, or Control combined with Command).
+    ///
+    /// This must run before `interpretKeyEvents:`, because AppKit's key
+    /// binding table swallows most Control combos as editing commands
+    /// (^D -> deleteForward:, ^A/^E/^K/^U/^N/^P/^B/^F/^W/^T/^V -> editing
+    /// selectors), which would never reach the shell otherwise.
+    pub(crate) fn control_key_bytes(event: &NSEvent) -> Option<Vec<u8>> {
+        let flags = event.modifierFlags();
+        if !flags.contains(NSEventModifierFlags::Control)
+            || flags.contains(NSEventModifierFlags::Command)
+        {
+            return None;
+        }
+        let chars = event.charactersIgnoringModifiers()?.to_string();
+        let mut chars = chars.chars();
+        let c = chars.next()?;
+        if chars.next().is_some() {
+            return None;
+        }
+        control_byte_for_char(c).map(|byte| vec![byte])
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -150,6 +240,25 @@ pub mod macos_keymap {
             out.clear();
             append_input_from_text("hello", &mut out);
             assert_eq!(out, b"hello");
+        }
+
+        #[test]
+        fn control_chars_map_for_shell_keys() {
+            assert_eq!(control_byte_for_char('c'), Some(0x03));
+            assert_eq!(control_byte_for_char('d'), Some(0x04));
+            assert_eq!(control_byte_for_char('z'), Some(0x1a));
+            assert_eq!(control_byte_for_char('C'), Some(0x03));
+            assert_eq!(control_byte_for_char('['), Some(0x1b));
+            assert_eq!(control_byte_for_char('\\'), Some(0x1c));
+            assert_eq!(control_byte_for_char(']'), Some(0x1d));
+            assert_eq!(control_byte_for_char(' '), Some(0x00));
+            assert_eq!(control_byte_for_char('2'), Some(0x00));
+            assert_eq!(control_byte_for_char('3'), Some(0x1b));
+            assert_eq!(control_byte_for_char('6'), Some(0x1e));
+            assert_eq!(control_byte_for_char('8'), Some(0x7f));
+            assert_eq!(control_byte_for_char('/'), Some(0x1f));
+            assert_eq!(control_byte_for_char('\r'), None);
+            assert_eq!(control_byte_for_char('é'), None);
         }
     }
 }
