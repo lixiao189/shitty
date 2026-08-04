@@ -1,5 +1,8 @@
 use crate::terminal::color::{Color32, DEFAULT_BG, DEFAULT_FG, xterm_256_color};
 
+/// Maximum number of scrollback rows kept above the visible screen.
+pub(crate) const SCROLLBACK_LEN: usize = 1000;
+
 /// A position in the terminal grid; row 0 is the top line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CellPos {
@@ -19,6 +22,8 @@ pub(crate) struct TerminalGrid {
     default_fg: Color32,
     default_bg: Color32,
     has_changes: bool,
+    /// Number of scrollback rows currently available above the screen.
+    max_scrollback: usize,
 }
 
 impl TerminalGrid {
@@ -26,11 +31,12 @@ impl TerminalGrid {
         let cols = cols.max(1) as u16;
         let rows = rows.max(1) as u16;
         Self {
-            parser: vt100::Parser::new(rows, cols, 0),
+            parser: vt100::Parser::new(rows, cols, SCROLLBACK_LEN),
             palette: [None; 256],
             default_fg: DEFAULT_FG,
             default_bg: DEFAULT_BG,
             has_changes: false,
+            max_scrollback: 0,
         }
     }
 
@@ -63,13 +69,15 @@ impl TerminalGrid {
         if (rows, cols) == current_size {
             return false;
         }
-        self.parser.set_size(rows, cols);
+        self.parser.screen_mut().set_size(rows, cols);
+        self.refresh_max_scrollback();
         self.has_changes = true;
         true
     }
 
     pub(crate) fn process_pty_bytes(&mut self, bytes: &[u8]) {
         self.parser.process(bytes);
+        self.refresh_max_scrollback();
         self.has_changes = true;
     }
 
@@ -83,6 +91,50 @@ impl TerminalGrid {
         self.has_changes = false;
     }
 
+    /// How many rows the view is currently scrolled up: 0 is the normal
+    /// (bottom) screen, larger values show older history.
+    pub(crate) fn scroll_offset(&self) -> usize {
+        self.parser.screen().scrollback()
+    }
+
+    /// How many scrollback rows are available above the screen right now.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn max_scroll(&self) -> usize {
+        self.max_scrollback
+    }
+
+    /// Scroll the view so it starts `offset` rows above the bottom. Returns
+    /// whether the offset actually changed.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn scroll_to(&mut self, offset: usize) -> bool {
+        let target = offset.min(self.max_scrollback);
+        if target == self.scroll_offset() {
+            return false;
+        }
+        self.parser.screen_mut().set_scrollback(target);
+        true
+    }
+
+    /// Scroll by `delta` rows; positive moves toward older history, negative
+    /// back toward the live screen. Returns whether the offset changed.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn scroll_by(&mut self, delta: isize) -> bool {
+        let target = (self.scroll_offset() as isize + delta)
+            .clamp(0, self.max_scrollback as isize) as usize;
+        self.scroll_to(target)
+    }
+
+    /// Re-measure the scrollback fill and re-clamp the current offset.
+    ///
+    /// vt100 only exposes the current offset, so the fill level is probed by
+    /// asking for an absurd offset and reading back what it clamps to.
+    fn refresh_max_scrollback(&mut self) {
+        let current = self.scroll_offset();
+        self.parser.screen_mut().set_scrollback(usize::MAX);
+        self.max_scrollback = self.scroll_offset();
+        self.parser.screen_mut().set_scrollback(current);
+    }
+
     pub(crate) fn get_cell(&self, row: usize, col: usize) -> Option<CellInfo> {
         let screen = self.parser.screen();
         let size = screen.size(); // (rows, cols)
@@ -92,7 +144,7 @@ impl TerminalGrid {
 
         let cell = screen.cell(row as u16, col as u16)?;
         Some(CellInfo {
-            text: cell.contents(),
+            text: cell.contents().to_string(),
             fg: self.resolve_color(cell.fgcolor(), true),
             bg: self.resolve_color(cell.bgcolor(), false),
             underline: cell.underline(),
@@ -185,7 +237,9 @@ impl TerminalGrid {
 
     /// Cursor position and colors, resolved for direct drawing.
     pub(crate) fn cursor(&self) -> Option<CursorInfo> {
-        if !self.cursor_visible() {
+        // While scrolled up the cursor sits somewhere in the hidden history;
+        // hide it and let the next keypress snap back to the live screen.
+        if !self.cursor_visible() || self.scroll_offset() > 0 {
             return None;
         }
         let (row, col) = self.cursor_pos();
@@ -336,5 +390,88 @@ mod tests {
         let mut grid = TerminalGrid::new(4, 1);
         grid.process_pty_bytes(b"\x1b[?25l");
         assert!(grid.cursor().is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scrollback_accumulates_history() {
+        let mut grid = TerminalGrid::new(4, 2);
+        for i in 0..5u8 {
+            grid.process_pty_bytes(&[b'a' + i, b'\r', b'\n']);
+        }
+        // 5 newline-terminated lines into a 2-row screen: 4 rows of history.
+        assert_eq!(grid.scroll_offset(), 0);
+        assert_eq!(grid.max_scroll(), 4);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scroll_to_top_reveals_oldest_lines() {
+        let mut grid = TerminalGrid::new(4, 2);
+        for i in 0..5u8 {
+            grid.process_pty_bytes(&[b'a' + i, b'\r', b'\n']);
+        }
+        grid.scroll_to(4);
+        assert_eq!(grid.scroll_offset(), 4);
+        assert_eq!(grid.get_cell(0, 0).map(|c| c.text), Some("a".into()));
+        assert_eq!(grid.get_cell(1, 0).map(|c| c.text), Some("b".into()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scroll_offset_clamps_to_available_history() {
+        let mut grid = TerminalGrid::new(4, 2);
+        for i in 0..3u8 {
+            grid.process_pty_bytes(&[b'a' + i, b'\r', b'\n']);
+        }
+        // "a\r\nb\r\nc\r\n" into 2 rows leaves 2 lines of history.
+        assert_eq!(grid.max_scroll(), 2);
+        assert!(grid.scroll_to(1000));
+        assert_eq!(grid.scroll_offset(), 2);
+        // Already at the same offset is a no-op.
+        assert!(!grid.scroll_to(2));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scroll_by_moves_and_clamps() {
+        let mut grid = TerminalGrid::new(4, 2);
+        for i in 0..5u8 {
+            grid.process_pty_bytes(&[b'a' + i, b'\r', b'\n']);
+        }
+        assert!(grid.scroll_by(2));
+        assert_eq!(grid.scroll_offset(), 2);
+        assert!(grid.scroll_by(100));
+        assert_eq!(grid.scroll_offset(), 4);
+        assert!(grid.scroll_by(-100));
+        assert_eq!(grid.scroll_offset(), 0);
+        assert!(!grid.scroll_by(-100));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cursor_is_hidden_while_scrolled_up() {
+        let mut grid = TerminalGrid::new(4, 2);
+        for i in 0..5u8 {
+            grid.process_pty_bytes(&[b'a' + i, b'\r', b'\n']);
+        }
+        grid.scroll_to(4);
+        assert!(grid.cursor().is_none());
+        grid.scroll_to(0);
+        assert!(grid.cursor().is_some());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn view_stays_pinned_to_same_content_while_scrolled() {
+        let mut grid = TerminalGrid::new(4, 2);
+        for i in 0..5u8 {
+            grid.process_pty_bytes(&[b'a' + i, b'\r', b'\n']);
+        }
+        grid.scroll_to(1);
+        let before = grid.get_cell(0, 0).map(|c| c.text);
+        // New output while scrolled up must not yank the view to the bottom.
+        grid.process_pty_bytes(b"f\r\n");
+        assert_eq!(grid.get_cell(0, 0).map(|c| c.text), before);
     }
 }

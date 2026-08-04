@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 nix = { version = "0.31.1", features = ["term"] }
-vt100 = "0.15"
+vt100 = "0.16.2"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 eframe = "0.33.3"

@@ -23,6 +23,15 @@ use super::cast_any_object;
 /// Refresh rate for the terminal rendering timer (in Hz).
 const RENDER_REFRESH_RATE_HZ: f64 = 120.0;
 
+/// Width of the scrollbar drawn over the right edge of the view.
+const SCROLLBAR_WIDTH: f64 = 12.0;
+/// Minimum scrollbar thumb height in points.
+const SCROLLBAR_MIN_THUMB: f64 = 24.0;
+/// Horizontal inset of the thumb inside the scrollbar track.
+const SCROLLBAR_INSET: f64 = 2.0;
+/// Lines scrolled per notch of a non-precise (mouse wheel) event.
+const WHEEL_NOTCH_LINES: f64 = 3.0;
+
 /// Rust-side state shared by the terminal view and its render timer.
 pub(super) struct TerminalViewState {
     grid: TerminalGrid,
@@ -38,6 +47,10 @@ pub(super) struct TerminalViewState {
     skip_next_command: bool,
     selection: Option<Selection>,
     resize_debouncer: ResizeDebouncer,
+    /// Fractional scroll-wheel delta waiting to be applied to the grid.
+    scroll_accum: f64,
+    /// Whether the scrollbar thumb is being dragged.
+    scrollbar_dragging: bool,
 }
 
 impl TerminalViewState {
@@ -62,13 +75,67 @@ impl TerminalViewState {
             skip_next_command: false,
             selection: None,
             resize_debouncer: ResizeDebouncer::new(),
+            scroll_accum: 0.0,
+            scrollbar_dragging: false,
         }
     }
 
-    fn send_input(&self, bytes: Vec<u8>) {
+    fn send_input(&mut self, bytes: Vec<u8>) {
         if !bytes.is_empty() {
+            // Any keyboard input snaps the view back to the live screen.
+            self.grid.scroll_to(0);
             let _ = self.tx_input.send(PtyEvent::Input(bytes));
         }
+    }
+
+    /// Scroll the view by whole lines; positive moves toward older history.
+    fn scroll_by_lines(&mut self, lines: isize) {
+        if self.grid.scroll_by(lines) {
+            self.selection = None;
+        }
+    }
+
+    /// Map a y position inside the scrollbar track to a scroll offset,
+    /// keeping the thumb centered under the cursor.
+    fn scroll_to_track_y(&mut self, y: f64, track: NSRect) {
+        let Some(thumb) = self.scrollbar_thumb(track) else {
+            return;
+        };
+        let track_h = track.size.height.max(0.0);
+        let travel = (track_h - thumb.size.height).max(0.0);
+        let max_scroll = self.grid.max_scroll();
+        let y = y - track.origin.y;
+        let thumb_y = (y - thumb.size.height / 2.0).clamp(0.0, travel);
+        let offset = if travel > 0.0 {
+            (thumb_y / travel * max_scroll as f64).round() as usize
+        } else {
+            0
+        };
+        if self.grid.scroll_to(offset) {
+            self.selection = None;
+        }
+    }
+
+    /// The thumb rect for the given track, or None when there is no history.
+    fn scrollbar_thumb(&self, track: NSRect) -> Option<NSRect> {
+        let max_scroll = self.grid.max_scroll();
+        if max_scroll == 0 {
+            return None;
+        }
+        let rows = self.grid.rows();
+        let content = max_scroll + rows;
+        let track_h = track.size.height.max(0.0);
+        let thumb_h = (rows as f64 / content as f64 * track_h)
+            .max(SCROLLBAR_MIN_THUMB)
+            .min(track_h);
+        let travel = (track_h - thumb_h).max(0.0);
+        // offset 0 (newest) puts the thumb at the bottom of the track.
+        let thumb_y = self.grid.scroll_offset() as f64 / max_scroll as f64 * travel;
+        let thumb_w = (track.size.width - 2.0 * SCROLLBAR_INSET).max(0.0);
+        Some(NSRect::new(
+            NSPoint::new(track.origin.x + SCROLLBAR_INSET, track.origin.y + thumb_y),
+            NSSize::new(thumb_w, thumb_h),
+        ))
     }
 
     fn send_resize(&mut self, cols: usize, rows: usize) {
@@ -177,6 +244,16 @@ define_class!(
             let Some(state) = (unsafe { state_ptr.as_mut() }) else {
                 return;
             };
+            let location = self.convertPoint_fromView(event.locationInWindow(), None);
+            let bounds = self.bounds();
+            if state.grid.max_scroll() > 0
+                && location.x >= bounds.origin.x + bounds.size.width - SCROLLBAR_WIDTH
+            {
+                state.scrollbar_dragging = true;
+                state.scroll_to_track_y(location.y, scrollbar_track(bounds));
+                self.setNeedsDisplay(true);
+                return;
+            }
             state.selection = Some(Selection::start(self.cell_at_event(event)));
             if let Some(window) = self.window() {
                 window.makeFirstResponder(Some(self));
@@ -190,6 +267,12 @@ define_class!(
             let Some(state) = (unsafe { state_ptr.as_mut() }) else {
                 return;
             };
+            if state.scrollbar_dragging {
+                let location = self.convertPoint_fromView(event.locationInWindow(), None);
+                state.scroll_to_track_y(location.y, scrollbar_track(self.bounds()));
+                self.setNeedsDisplay(true);
+                return;
+            }
             if let Some(selection) = state.selection.as_mut() {
                 selection.set_head(self.cell_at_event(event));
                 self.setNeedsDisplay(true);
@@ -202,9 +285,32 @@ define_class!(
             let Some(state) = (unsafe { state_ptr.as_mut() }) else {
                 return;
             };
+            state.scrollbar_dragging = false;
             if state.selection.as_ref().is_some_and(|s| s.is_empty()) {
                 state.selection = None;
                 self.setNeedsDisplay(true);
+            }
+        }
+
+        #[unsafe(method(scrollWheel:))]
+        fn scroll_wheel(&self, event: &NSEvent) {
+            let state_ptr = self.ivars().state;
+            let Some(state) = (unsafe { state_ptr.as_mut() }) else {
+                return;
+            };
+            let mut delta = event.scrollingDeltaY();
+            // Non-precise wheels report notches; scale them to whole lines.
+            if !event.hasPreciseScrollingDeltas() {
+                delta *= WHEEL_NOTCH_LINES;
+            }
+            state.scroll_accum += delta;
+            let lines = state.scroll_accum.trunc() as isize;
+            if lines != 0 {
+                state.scroll_accum -= lines as f64;
+                if state.grid.scroll_by(lines) {
+                    state.selection = None;
+                    self.setNeedsDisplay(true);
+                }
             }
         }
 
@@ -361,6 +467,10 @@ define_class!(
                 marked_fg.set();
                 NSBezierPath::fillRect(underline_rect);
             }
+
+            if state.grid.max_scroll() > 0 {
+                paint_scrollbar(state, bounds, scale);
+            }
         }
     }
 
@@ -400,6 +510,24 @@ define_class!(
             if state.skip_next_command {
                 state.skip_next_command = false;
                 return;
+            }
+
+            // PageUp/PageDown scroll the local history instead of reaching
+            // the shell.
+            if let Ok(name) = selector.name().to_str() {
+                match name {
+                    "scrollPageUp:" => {
+                        state.scroll_by_lines(state.grid.rows() as isize);
+                        self.setNeedsDisplay(true);
+                        return;
+                    }
+                    "scrollPageDown:" => {
+                        state.scroll_by_lines(-(state.grid.rows() as isize));
+                        self.setNeedsDisplay(true);
+                        return;
+                    }
+                    _ => {}
+                }
             }
 
             let mut input_bytes = Vec::new();
@@ -681,8 +809,7 @@ fn paint_selection_overlay(
     selection: &Selection,
     bounds: NSRect,
     scale: f64,
-) {
-    let color = NSColor::colorWithSRGBRed_green_blue_alpha(
+) {    let color = NSColor::colorWithSRGBRed_green_blue_alpha(
         SELECTION_BG.r as f64 / 255.0,
         SELECTION_BG.g as f64 / 255.0,
         SELECTION_BG.b as f64 / 255.0,
@@ -718,6 +845,44 @@ fn paint_selection_overlay(
             }
         }
     }
+}
+
+/// The full-height scrollbar track rect along the right edge of the view.
+fn scrollbar_track(bounds: NSRect) -> NSRect {
+    NSRect::new(
+        NSPoint::new(
+            bounds.origin.x + bounds.size.width - SCROLLBAR_WIDTH,
+            bounds.origin.y,
+        ),
+        NSSize::new(SCROLLBAR_WIDTH, bounds.size.height),
+    )
+}
+
+fn paint_scrollbar(state: &TerminalViewState, bounds: NSRect, scale: f64) {
+    let track = scrollbar_track(bounds);
+    let Some(thumb) = state.scrollbar_thumb(track) else {
+        return;
+    };
+
+    let track_color = NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.05);
+    track_color.set();
+    NSBezierPath::fillRect(track);
+
+    let thumb_x0 = snap_to_pixel(thumb.origin.x, scale);
+    let thumb_y0 = snap_to_pixel(thumb.origin.y, scale);
+    let thumb_rect = NSRect::new(
+        NSPoint::new(thumb_x0, thumb_y0),
+        NSSize::new(
+            (thumb.origin.x + thumb.size.width - thumb_x0).max(0.0),
+            (thumb.origin.y + thumb.size.height - thumb_y0).max(0.0),
+        ),
+    );
+    let radius = (thumb_rect.size.width / 2.0).max(0.0);
+    let path =
+        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(thumb_rect, radius, radius);
+    let thumb_color = NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.28);
+    thumb_color.set();
+    path.fill();
 }
 
 fn ns_object_to_string(obj: &AnyObject) -> Option<String> {
