@@ -821,7 +821,8 @@ fn paint_selection_overlay(
     selection: &Selection,
     bounds: NSRect,
     scale: f64,
-) {    let color = NSColor::colorWithSRGBRed_green_blue_alpha(
+) {
+    let color = NSColor::colorWithSRGBRed_green_blue_alpha(
         SELECTION_BG.r as f64 / 255.0,
         SELECTION_BG.g as f64 / 255.0,
         SELECTION_BG.b as f64 / 255.0,
@@ -890,8 +891,7 @@ fn paint_scrollbar(state: &TerminalViewState, bounds: NSRect, scale: f64) {
         ),
     );
     let radius = (thumb_rect.size.width / 2.0).max(0.0);
-    let path =
-        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(thumb_rect, radius, radius);
+    let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(thumb_rect, radius, radius);
     let thumb_color = NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.28);
     thumb_color.set();
     path.fill();

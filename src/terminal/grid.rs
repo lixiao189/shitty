@@ -119,8 +119,8 @@ impl TerminalGrid {
     /// back toward the live screen. Returns whether the offset changed.
     #[cfg(target_os = "macos")]
     pub(crate) fn scroll_by(&mut self, delta: isize) -> bool {
-        let target = (self.scroll_offset() as isize + delta)
-            .clamp(0, self.max_scrollback as isize) as usize;
+        let target =
+            (self.scroll_offset() as isize + delta).clamp(0, self.max_scrollback as isize) as usize;
         self.scroll_to(target)
     }
 

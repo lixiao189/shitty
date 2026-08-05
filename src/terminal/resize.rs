@@ -1,7 +1,6 @@
 /// How many render ticks a size must stay unchanged before it is applied to
-/// the grid and PTY. At the AppKit timer's 120 Hz this is ~150 ms; on egui it
-/// is a similar number of frames. This turns a continuous live drag into a
-/// single resize once the drag settles.
+/// the grid and PTY. At the AppKit timer's 120 Hz this is ~150 ms. This turns
+/// a continuous live drag into a single resize once the drag settles.
 const RESIZE_STABLE_TICKS: u32 = 18;
 
 /// Coalesces window-size changes so the grid and PTY are resized together,

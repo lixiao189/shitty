@@ -4,9 +4,8 @@
 
 This is **Shitty**, a small terminal emulator written in Rust (2024 edition). The crate is a binary with no separate `tests/` directory; unit tests live inline in source modules.
 
-- `src/main.rs` — entry point that routes to the macOS AppKit or egui backend.
-- `src/mac_app.rs` — native macOS AppKit window, view, and renderer.
-- `src/fallback_app.rs` — egui UI for non-macOS platforms, PTY threads, and font setup.
+- `src/main.rs` — entry point that runs the macOS AppKit backend.
+- `src/mac_app/` — native macOS AppKit window, view, and renderer.
 - `src/terminal/` — terminal core: `grid.rs` (vt100 parser wrapper), `color.rs` (ANSI/xterm/RGB color mapping), `keymap.rs` (key translation), `pty.rs` (PTY lifecycle and resize).
 - `assets/` — bundled Nerd Font variants and images (e.g., `arch.png`, `icon.png`).
 - `target_local/` — build output; the custom target dir is set in `.cargo/config.toml`.
@@ -41,4 +40,4 @@ cargo test           # run all inline unit tests
 
 ## Platform-Specific Notes
 
-- macOS uses the AppKit path (`mac_app.rs`) and objc2 dependencies; other platforms use egui via `eframe`. Changes to terminal behavior should verify both paths where feasible, since they render independently.
+- This project targets macOS only: the AppKit path (`src/mac_app/`) uses objc2 and the AppKit frameworks.

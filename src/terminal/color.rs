@@ -69,10 +69,3 @@ pub(crate) fn xterm_256_color(index: u8) -> Color32 {
     let gray = 8u8.saturating_add((index - 232).saturating_mul(10));
     Color32::from_rgb(gray, gray, gray)
 }
-
-#[cfg(not(target_os = "macos"))]
-impl From<Color32> for eframe::egui::Color32 {
-    fn from(c: Color32) -> Self {
-        eframe::egui::Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
-    }
-}
