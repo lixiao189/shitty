@@ -41,6 +41,7 @@ impl Pty {
         tx_output: Sender<Vec<u8>>,
         rx_input: Receiver<PtyEvent>,
         on_output: impl Fn() + Send + 'static,
+        on_exit: impl Fn() + Send + 'static,
     ) {
         let master_read = self.master.try_clone().expect("master fd clone failed");
         let master_write = self.master.try_clone().expect("master fd clone failed");
@@ -50,7 +51,13 @@ impl Pty {
             loop {
                 let mut buffer = [0u8; 8192];
                 match read(master_read.as_fd(), &mut buffer) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) | Err(_) => {
+                        // EOF means every process holding the slave side has
+                        // exited (e.g. ^D closed the login shell), so the
+                        // session is over.
+                        on_exit();
+                        break;
+                    }
                     Ok(n) => {
                         if tx_output.send(buffer[..n].to_vec()).is_err() {
                             break;

@@ -20,8 +20,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let pty = Pty::spawn()?;
     let (tx_pty_output, rx_pty_output) = channel::<Vec<u8>>();
     let (tx_pty_input, rx_pty_input) = channel::<PtyEvent>();
+    let (tx_pty_exit, rx_pty_exit) = channel::<()>();
     // The AppKit timer polls `rx_pty_output`, so no extra repaint wake-up is needed.
-    pty.spawn_threads(tx_pty_output, rx_pty_input, || {});
+    pty.spawn_threads(
+        tx_pty_output,
+        rx_pty_input,
+        || {},
+        move || {
+            let _ = tx_pty_exit.send(());
+        },
+    );
 
     let mtm = MainThreadMarker::new().ok_or("must be on main thread")?;
     let app = NSApplication::sharedApplication(mtm);
@@ -33,7 +41,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let delegate = ShittyAppDelegate::new(mtm, rx_pty_output, tx_pty_input);
+    let delegate = ShittyAppDelegate::new(mtm, rx_pty_output, tx_pty_input, rx_pty_exit);
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
 
     app.run();
@@ -54,16 +62,24 @@ fn load_app_icon(_mtm: MainThreadMarker) -> Option<Retained<NSImage>> {
     Some(image)
 }
 
-struct QuitMenuItemSpec {
+struct ShortcutMenuItemSpec {
     title: &'static str,
     key_equivalent: &'static str,
     modifier_mask: objc2_app_kit::NSEventModifierFlags,
 }
 
-fn macos_quit_menu_item_spec() -> QuitMenuItemSpec {
-    QuitMenuItemSpec {
+fn macos_quit_menu_item_spec() -> ShortcutMenuItemSpec {
+    ShortcutMenuItemSpec {
         title: "Quit shitty",
         key_equivalent: "q",
+        modifier_mask: objc2_app_kit::NSEventModifierFlags::Command,
+    }
+}
+
+fn macos_close_window_menu_item_spec() -> ShortcutMenuItemSpec {
+    ShortcutMenuItemSpec {
+        title: "Close Window",
+        key_equivalent: "w",
         modifier_mask: objc2_app_kit::NSEventModifierFlags::Command,
     }
 }
@@ -134,8 +150,9 @@ impl ShittyAppDelegate {
         mtm: MainThreadMarker,
         rx_output: Receiver<Vec<u8>>,
         tx_input: Sender<PtyEvent>,
+        rx_exit: Receiver<()>,
     ) -> Retained<Self> {
-        let view_state = terminal_view_state(rx_output, tx_input);
+        let view_state = terminal_view_state(rx_output, tx_input, rx_exit);
         let this = Self::alloc(mtm).set_ivars(AppDelegateIvars::new(mtm, view_state));
         unsafe { msg_send![super(this), init] }
     }
@@ -144,10 +161,11 @@ impl ShittyAppDelegate {
 fn terminal_view_state(
     rx_output: Receiver<Vec<u8>>,
     tx_input: Sender<PtyEvent>,
+    rx_exit: Receiver<()>,
 ) -> TerminalViewState {
     let font = load_terminal_font(14.0);
     let (cell_width, cell_height) = measure_cell_size(&font);
-    TerminalViewState::new(rx_output, tx_input, font, cell_width, cell_height)
+    TerminalViewState::new(rx_output, tx_input, rx_exit, font, cell_width, cell_height)
 }
 
 struct AppDelegateIvars {
@@ -196,6 +214,33 @@ fn setup_main_menu(mtm: MainThreadMarker) {
     };
     quit_item.setKeyEquivalentModifierMask(quit_spec.modifier_mask);
     app_menu.addItem(&quit_item);
+
+    let file_menu_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("File"),
+            None,
+            ns_string!(""),
+        )
+    };
+    menubar.addItem(&file_menu_item);
+
+    let file_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("File"));
+    file_menu_item.setSubmenu(Some(&file_menu));
+
+    let close_spec = macos_close_window_menu_item_spec();
+    let close_title = NSString::from_str(close_spec.title);
+    let close_key = NSString::from_str(close_spec.key_equivalent);
+    let close_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &close_title,
+            Some(sel!(performClose:)),
+            &close_key,
+        )
+    };
+    close_item.setKeyEquivalentModifierMask(close_spec.modifier_mask);
+    file_menu.addItem(&close_item);
 }
 
 #[cfg(test)]
@@ -207,6 +252,17 @@ mod tests {
         let spec = macos_quit_menu_item_spec();
         assert_eq!(spec.title, "Quit shitty");
         assert_eq!(spec.key_equivalent, "q");
+        assert!(
+            spec.modifier_mask
+                .contains(objc2_app_kit::NSEventModifierFlags::Command)
+        );
+    }
+
+    #[test]
+    fn macos_command_w_close_window_spec_is_standard() {
+        let spec = macos_close_window_menu_item_spec();
+        assert_eq!(spec.title, "Close Window");
+        assert_eq!(spec.key_equivalent, "w");
         assert!(
             spec.modifier_mask
                 .contains(objc2_app_kit::NSEventModifierFlags::Command)

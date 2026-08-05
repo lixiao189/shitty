@@ -37,6 +37,7 @@ pub(super) struct TerminalViewState {
     grid: TerminalGrid,
     rx_output: Receiver<Vec<u8>>,
     tx_input: Sender<PtyEvent>,
+    rx_exit: Receiver<()>,
     font: Retained<NSFont>,
     cell_width: f64,
     cell_height: f64,
@@ -57,6 +58,7 @@ impl TerminalViewState {
     pub(super) fn new(
         rx_output: Receiver<Vec<u8>>,
         tx_input: Sender<PtyEvent>,
+        rx_exit: Receiver<()>,
         font: Retained<NSFont>,
         cell_width: f64,
         cell_height: f64,
@@ -65,6 +67,7 @@ impl TerminalViewState {
             grid: TerminalGrid::new(80, 24),
             rx_output,
             tx_input,
+            rx_exit,
             font,
             cell_width,
             cell_height,
@@ -699,6 +702,13 @@ impl ShittyTerminalView {
         }
     }
 
+    /// Close the window, which the app delegate turns into a full quit.
+    fn close_window(&self) {
+        if let Some(window) = self.window() {
+            window.performClose(None);
+        }
+    }
+
     /// Convert a mouse event into a snapped grid cell.
     fn cell_at_event(&self, event: &NSEvent) -> CellPos {
         let state_ptr = self.ivars().state;
@@ -755,6 +765,11 @@ define_class!(
             while let Ok(bytes) = state.rx_output.try_recv() {
                 state.grid.process_pty_bytes(&bytes);
                 received_data = true;
+            }
+
+            if state.rx_exit.try_recv().is_ok() {
+                self.ivars().view.close_window();
+                return;
             }
 
             if received_data {
