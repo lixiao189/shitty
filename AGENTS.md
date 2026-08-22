@@ -6,7 +6,7 @@ This is **Shitty**, a small terminal emulator written in Rust (2024 edition). Th
 
 - `src/main.rs` — entry point that runs the macOS AppKit backend.
 - `src/mac_app/` — native macOS AppKit window, view, and renderer.
-- `src/terminal/` — terminal core: `grid.rs` (vt100 parser wrapper), `color.rs` (ANSI/xterm/RGB color mapping), `keymap.rs` (key translation), `pty.rs` (PTY lifecycle and resize).
+- `src/terminal/` — terminal core: `grid.rs` (alacritty_terminal parser wrapper), `color.rs` (ANSI/xterm/RGB color mapping), `keymap.rs` (key translation), `pty.rs` (PTY lifecycle and resize).
 - `assets/` — bundled Nerd Font variants and images (e.g., `arch.png`, `icon.png`).
 - `target_local/` — build output; the custom target dir is set in `.cargo/config.toml`.
 

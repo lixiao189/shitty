@@ -14,7 +14,7 @@
  \_____\/   \/_/    \/_/ \/_________/\_\/       \_\/               \/_/
 ```
 
-A tiny terminal emulator in Rust. Uses vt100 for parsing, a PTY for the shell,
+A tiny terminal emulator in Rust. Uses alacritty_terminal for parsing, a PTY for the shell,
 and a native AppKit renderer on macOS.
 
 ## Quick Start
@@ -36,7 +36,7 @@ Binary output: `target_local/` (see `.cargo/config.toml`).
 
 ## Features
 
-- VT100 parsing via `vt100` with a cell grid model.
+- ANSI/VT parsing via `alacritty_terminal` with a cell grid model.
 - PTY-backed shell (`/bin/zsh`) with proper resize signaling.
 - ANSI 16-color, xterm 256-color, and truecolor RGB support.
 - Wide-character handling and underline rendering.
@@ -53,7 +53,7 @@ Binary output: `target_local/` (see `.cargo/config.toml`).
 ```mermaid
 flowchart LR
   APP[NSApp + NSWindow] --> VIEW[ShittyTerminalView]
-  VIEW --> GRID[TerminalGrid + vt100 parser]
+  VIEW --> GRID[TerminalGrid + alacritty_terminal parser]
   VIEW -- key events --> TX[tx_pty_input]
   TX --> W[PTY Write Thread]
   W --> MFD[PTY master FD]
@@ -70,7 +70,7 @@ flowchart LR
 - `src/mac_app/`: native AppKit UI — `app.rs` (bootstrap, menu, window),
   `view.rs` (terminal view, rendering, IME), `font.rs` (font loading).
 - `src/terminal/mod.rs`: terminal module exports.
-- `src/terminal/grid.rs`: vt100 parser wrapper and grid access.
+- `src/terminal/grid.rs`: alacritty_terminal parser wrapper and grid access.
 - `src/terminal/color.rs`: ANSI/xterm color mapping.
 - `src/terminal/keymap.rs`: key event translation (AppKit).
 - `src/terminal/pty.rs`: PTY session lifecycle, resize handling, and IO threads.

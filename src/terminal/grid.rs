@@ -1,4 +1,10 @@
-use crate::terminal::color::{Color32, DEFAULT_BG, DEFAULT_FG, xterm_256_color};
+use crate::terminal::color::{Color32, DEFAULT_BG, DEFAULT_FG, ansi_16_color, xterm_256_color};
+use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::term::cell::{Flags, LineLength};
+use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
 
 /// Maximum number of scrollback rows kept above the visible screen.
 pub(crate) const SCROLLBACK_LEN: usize = 1000;
@@ -16,36 +22,60 @@ impl CellPos {
     }
 }
 
+/// Dimensions used when creating or resizing an alacritty terminal.
+#[derive(Clone, Copy)]
+struct GridSize {
+    cols: usize,
+    rows: usize,
+}
+
+impl Dimensions for GridSize {
+    fn total_lines(&self) -> usize {
+        self.rows
+    }
+
+    fn screen_lines(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.cols
+    }
+}
+
 pub(crate) struct TerminalGrid {
-    parser: vt100::Parser,
+    term: Term<VoidListener>,
+    parser: Processor,
     palette: [Option<Color32>; 256],
     default_fg: Color32,
     default_bg: Color32,
     has_changes: bool,
-    /// Number of scrollback rows currently available above the screen.
-    max_scrollback: usize,
 }
 
 impl TerminalGrid {
     pub(crate) fn new(cols: usize, rows: usize) -> Self {
-        let cols = cols.max(1) as u16;
-        let rows = rows.max(1) as u16;
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        let config = Config {
+            scrolling_history: SCROLLBACK_LEN,
+            ..Default::default()
+        };
         Self {
-            parser: vt100::Parser::new(rows, cols, SCROLLBACK_LEN),
+            term: Term::new(config, &GridSize { cols, rows }, VoidListener),
+            parser: Processor::new(),
             palette: [None; 256],
             default_fg: DEFAULT_FG,
             default_bg: DEFAULT_BG,
             has_changes: false,
-            max_scrollback: 0,
         }
     }
 
     pub(crate) fn rows(&self) -> usize {
-        self.parser.screen().size().0 as usize // size() returns (rows, cols)
+        self.term.screen_lines()
     }
 
     pub(crate) fn cols(&self) -> usize {
-        self.parser.screen().size().1 as usize // size() returns (rows, cols)
+        self.term.columns()
     }
 
     pub(crate) fn default_bg(&self) -> Color32 {
@@ -53,31 +83,28 @@ impl TerminalGrid {
     }
 
     pub(crate) fn cursor_visible(&self) -> bool {
-        !self.parser.screen().hide_cursor()
+        self.term.mode().contains(TermMode::SHOW_CURSOR)
     }
 
     pub(crate) fn cursor_pos(&self) -> (usize, usize) {
-        let pos = self.parser.screen().cursor_position();
-        (pos.0 as usize, pos.1 as usize)
+        let point = self.term.grid().cursor.point;
+        let row = (point.line.0 + self.scroll_offset() as i32) as usize;
+        (row, point.column.0)
     }
 
     pub(crate) fn resize(&mut self, cols: usize, rows: usize) -> bool {
-        let cols = cols.max(1) as u16;
-        let rows = rows.max(1) as u16;
-        let current_size = self.parser.screen().size();
-        // size() returns (rows, cols), so compare with (rows, cols)
-        if (rows, cols) == current_size {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        if cols == self.cols() && rows == self.rows() {
             return false;
         }
-        self.parser.screen_mut().set_size(rows, cols);
-        self.refresh_max_scrollback();
+        self.term.resize(GridSize { cols, rows });
         self.has_changes = true;
         true
     }
 
     pub(crate) fn process_pty_bytes(&mut self, bytes: &[u8]) {
-        self.parser.process(bytes);
-        self.refresh_max_scrollback();
+        self.parser.advance(&mut self.term, bytes);
         self.has_changes = true;
     }
 
@@ -94,24 +121,27 @@ impl TerminalGrid {
     /// How many rows the view is currently scrolled up: 0 is the normal
     /// (bottom) screen, larger values show older history.
     pub(crate) fn scroll_offset(&self) -> usize {
-        self.parser.screen().scrollback()
+        self.term.grid().display_offset()
     }
 
     /// How many scrollback rows are available above the screen right now.
     #[cfg(target_os = "macos")]
     pub(crate) fn max_scroll(&self) -> usize {
-        self.max_scrollback
+        self.term.grid().history_size()
     }
 
     /// Scroll the view so it starts `offset` rows above the bottom. Returns
     /// whether the offset actually changed.
     #[cfg(target_os = "macos")]
     pub(crate) fn scroll_to(&mut self, offset: usize) -> bool {
-        let target = offset.min(self.max_scrollback);
+        let target = offset.min(self.max_scroll());
         if target == self.scroll_offset() {
             return false;
         }
-        self.parser.screen_mut().set_scrollback(target);
+        let delta = target as isize - self.scroll_offset() as isize;
+        self.term
+            .grid_mut()
+            .scroll_display(Scroll::Delta(delta as i32));
         true
     }
 
@@ -120,37 +150,44 @@ impl TerminalGrid {
     #[cfg(target_os = "macos")]
     pub(crate) fn scroll_by(&mut self, delta: isize) -> bool {
         let target =
-            (self.scroll_offset() as isize + delta).clamp(0, self.max_scrollback as isize) as usize;
+            (self.scroll_offset() as isize + delta).clamp(0, self.max_scroll() as isize) as usize;
         self.scroll_to(target)
     }
 
-    /// Re-measure the scrollback fill and re-clamp the current offset.
-    ///
-    /// vt100 only exposes the current offset, so the fill level is probed by
-    /// asking for an absurd offset and reading back what it clamps to.
-    fn refresh_max_scrollback(&mut self) {
-        let current = self.scroll_offset();
-        self.parser.screen_mut().set_scrollback(usize::MAX);
-        self.max_scrollback = self.scroll_offset();
-        self.parser.screen_mut().set_scrollback(current);
-    }
-
     pub(crate) fn get_cell(&self, row: usize, col: usize) -> Option<CellInfo> {
-        let screen = self.parser.screen();
-        let size = screen.size(); // (rows, cols)
-        if row >= size.0 as usize || col >= size.1 as usize {
+        if row >= self.rows() || col >= self.cols() {
             return None;
         }
 
-        let cell = screen.cell(row as u16, col as u16)?;
+        let line = Line(row as i32 - self.scroll_offset() as i32);
+        let cell = &self.term.grid()[Point::new(line, Column(col))];
+        let wide_continuation = cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
+        let is_unwritten_blank = cell.c == ' '
+            && col >= self.term.grid()[line].line_length().0
+            && cell.flags.is_empty()
+            && cell.fg == Color::Named(NamedColor::Foreground)
+            && cell.bg == Color::Named(NamedColor::Background);
+
+        let text = if wide_continuation || is_unwritten_blank {
+            String::new()
+        } else {
+            let mut text = cell.c.to_string();
+            for c in cell.zerowidth().into_iter().flatten() {
+                text.push(*c);
+            }
+            text
+        };
+
         Some(CellInfo {
-            text: cell.contents().to_string(),
-            fg: self.resolve_color(cell.fgcolor(), true),
-            bg: self.resolve_color(cell.bgcolor(), false),
-            underline: cell.underline(),
-            inverse: cell.inverse(),
-            wide: cell.is_wide(),
-            wide_continuation: cell.is_wide_continuation(),
+            text,
+            fg: self.resolve_color(cell.fg),
+            bg: self.resolve_color(cell.bg),
+            underline: cell.flags.intersects(Flags::ALL_UNDERLINES),
+            inverse: cell.flags.contains(Flags::INVERSE),
+            wide: cell.flags.contains(Flags::WIDE_CHAR),
+            wide_continuation,
         })
     }
 
@@ -224,6 +261,17 @@ impl TerminalGrid {
                 // absorb blank cells (or vice versa), otherwise distant text
                 // would collapse into a single run drawn at the wrong column.
                 && prev.text.is_empty() == run.text.is_empty()
+                // Keep whitespace-only cells separate from each other and from
+                // real text. Alacritty cannot distinguish an explicitly typed
+                // space from an untouched cell in the occupied prefix, so this
+                // preserves the old rendering where leading spaces were
+                // individual runs.
+                && (!prev.text.is_empty() && prev.text.trim().is_empty())
+                    == (!run.text.is_empty() && run.text.trim().is_empty())
+                && (prev.text.is_empty()
+                    || run.text.is_empty()
+                    || !prev.text.trim().is_empty()
+                    || !run.text.trim().is_empty())
             {
                 prev.text.push_str(&run.text);
                 prev.width += run.width;
@@ -267,23 +315,29 @@ impl TerminalGrid {
         })
     }
 
-    fn resolve_color(&self, color: vt100::Color, is_fg: bool) -> Color32 {
+    fn resolve_color(&self, color: Color) -> Color32 {
         match color {
-            vt100::Color::Default => {
-                if is_fg {
-                    self.default_fg
-                } else {
-                    self.default_bg
-                }
-            }
-            vt100::Color::Idx(idx) => {
+            Color::Named(NamedColor::Foreground) => self.default_fg,
+            Color::Named(NamedColor::Background) => self.default_bg,
+            Color::Named(named) => self.resolve_named_color(named),
+            Color::Indexed(idx) => {
                 if let Some(color) = self.palette[idx as usize] {
                     color
                 } else {
                     xterm_256_color(idx)
                 }
             }
-            vt100::Color::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
+            Color::Spec(rgb) => Color32::from_rgb(rgb.r, rgb.g, rgb.b),
+        }
+    }
+
+    fn resolve_named_color(&self, named: NamedColor) -> Color32 {
+        match named as usize {
+            0..=15 => ansi_16_color(named as usize as u8),
+            258 => Color32::WHITE,
+            259..=266 => ansi_16_color((named as usize - 259) as u8),
+            267 | 268 => self.default_fg,
+            _ => self.default_fg,
         }
     }
 }

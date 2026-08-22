@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-**Shitty** — a macOS terminal emulator built in Rust using AppKit and the `vt100` crate for VT100 parsing. It spawns a `/bin/zsh` shell via a Unix PTY.
+**Shitty** — a macOS terminal emulator built in Rust using AppKit and the `alacritty_terminal` crate for ANSI/VT parsing. It spawns a `/bin/zsh` shell via a Unix PTY.
 
 ## Commands
 
@@ -32,7 +32,7 @@ UI Main Thread (AppKit)
 
 **AppKit path** (`mac_app/`): Creates the PTY pair, spawns zsh on the slave, starts the two PTY threads, opens an NSWindow, and renders the grid cell-by-cell in the terminal view. Keyboard input is converted to terminal bytes and sent through `tx_pty_input`. Window resize is detected and sent as a `PtyEvent::Resize` to the write thread. An NSTimer drives render updates at ~120Hz.
 
-**Terminal state** (`terminal/grid.rs: TerminalGrid`): Wraps the `vt100` parser. Processes raw PTY bytes and exposes the resulting grid (cell text, colors, attributes, cursor position).
+**Terminal state** (`terminal/grid.rs: TerminalGrid`): Wraps the `alacritty_terminal` terminal/parser. Processes raw PTY bytes and exposes the resulting grid (cell text, colors, attributes, cursor position).
 
 **PTY events** (`terminal/pty.rs`): Defines `PtyEvent` — either `Input(Vec<u8>)` or `Resize { cols, rows }`. `apply_resize()` sends `TIOCSWINSZ` + `SIGWINCH`.
 
