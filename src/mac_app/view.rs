@@ -23,6 +23,9 @@ use super::cast_any_object;
 /// Refresh rate for the terminal rendering timer (in Hz).
 const RENDER_REFRESH_RATE_HZ: f64 = 120.0;
 
+/// Cap on PTY bytes parsed per render tick, so a huge redraw burst never freezes the main thread.
+const MAX_PTY_BYTES_PER_TICK: usize = 256 * 1024;
+
 /// Width of the scrollbar drawn over the right edge of the view.
 const SCROLLBAR_WIDTH: f64 = 12.0;
 /// Minimum scrollbar thumb height in points.
@@ -64,7 +67,13 @@ impl TerminalViewState {
         cell_height: f64,
     ) -> Self {
         Self {
-            grid: TerminalGrid::new(80, 24),
+            grid: TerminalGrid::new_with_pty_size(
+                80,
+                24,
+                tx_input.clone(),
+                cell_width,
+                cell_height,
+            ),
             rx_output,
             tx_input,
             rx_exit,
@@ -761,10 +770,18 @@ define_class!(
             // Drain pending output before resizing: bytes written for the
             // current width must be processed at that width, otherwise a
             // shell redraw can wrap at a smaller grid and leave duplicates.
+            // The byte cap keeps a giant redraw burst from freezing the main thread.
             let mut received_data = false;
-            while let Ok(bytes) = state.rx_output.try_recv() {
-                state.grid.process_pty_bytes(&bytes);
-                received_data = true;
+            let mut processed_bytes = 0usize;
+            while processed_bytes < MAX_PTY_BYTES_PER_TICK {
+                match state.rx_output.try_recv() {
+                    Ok(bytes) => {
+                        processed_bytes += bytes.len();
+                        state.grid.process_pty_bytes(&bytes);
+                        received_data = true;
+                    }
+                    Err(_) => break,
+                }
             }
 
             if state.rx_exit.try_recv().is_ok() {

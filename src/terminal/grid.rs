@@ -1,10 +1,14 @@
 use crate::terminal::color::{Color32, DEFAULT_BG, DEFAULT_FG, ansi_16_color, xterm_256_color};
-use alacritty_terminal::event::VoidListener;
+use crate::terminal::pty::PtyEvent;
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::{Flags, LineLength};
 use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::mpsc::Sender;
 
 /// Maximum number of scrollback rows kept above the visible screen.
 pub(crate) const SCROLLBACK_LEN: usize = 1000;
@@ -43,13 +47,27 @@ impl Dimensions for GridSize {
     }
 }
 
+/// Buffer for terminal-generated events that need a response (DSR, color queries, ...).
+#[derive(Clone)]
+struct EventBuffer(Rc<RefCell<Vec<Event>>>);
+
+impl EventListener for EventBuffer {
+    fn send_event(&self, event: Event) {
+        self.0.borrow_mut().push(event);
+    }
+}
+
 pub(crate) struct TerminalGrid {
-    term: Term<VoidListener>,
+    term: Term<EventBuffer>,
     parser: Processor,
     palette: [Option<Color32>; 256],
     default_fg: Color32,
     default_bg: Color32,
     has_changes: bool,
+    cell_width: f64,
+    cell_height: f64,
+    event_tx: Option<Sender<PtyEvent>>,
+    pending_events: Rc<RefCell<Vec<Event>>>,
 }
 
 impl TerminalGrid {
@@ -60,14 +78,35 @@ impl TerminalGrid {
             scrolling_history: SCROLLBACK_LEN,
             ..Default::default()
         };
+        let pending_events: Rc<RefCell<Vec<Event>>> = Rc::new(RefCell::new(Vec::new()));
+        let listener = EventBuffer(pending_events.clone());
         Self {
-            term: Term::new(config, &GridSize { cols, rows }, VoidListener),
+            term: Term::new(config, &GridSize { cols, rows }, listener),
             parser: Processor::new(),
             palette: [None; 256],
             default_fg: DEFAULT_FG,
             default_bg: DEFAULT_BG,
             has_changes: false,
+            cell_width: 1.0,
+            cell_height: 1.0,
+            event_tx: None,
+            pending_events,
         }
+    }
+
+    /// Create a grid wired to a PTY writer so terminal queries can be answered.
+    pub(crate) fn new_with_pty_size(
+        cols: usize,
+        rows: usize,
+        tx_input: Sender<PtyEvent>,
+        cell_width: f64,
+        cell_height: f64,
+    ) -> Self {
+        let mut grid = Self::new(cols, rows);
+        grid.event_tx = Some(tx_input);
+        grid.cell_width = cell_width;
+        grid.cell_height = cell_height;
+        grid
     }
 
     pub(crate) fn rows(&self) -> usize {
@@ -105,7 +144,63 @@ impl TerminalGrid {
 
     pub(crate) fn process_pty_bytes(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
+        self.handle_terminal_events();
         self.has_changes = true;
+    }
+
+    /// Drain pending terminal events and write query responses (DSR, color, size) to the PTY.
+    fn handle_terminal_events(&self) {
+        let events = std::mem::take(&mut *self.pending_events.borrow_mut());
+        for event in events {
+            match event {
+                Event::PtyWrite(text) => self.write_to_pty(text.into_bytes()),
+                Event::ColorRequest(index, formatter) => {
+                    if let Some(color) = self.color_for_index(index) {
+                        let rgb = Rgb {
+                            r: color.r,
+                            g: color.g,
+                            b: color.b,
+                        };
+                        self.write_to_pty(formatter(rgb).into_bytes());
+                    }
+                }
+                Event::TextAreaSizeRequest(formatter) => {
+                    let window_size = WindowSize {
+                        num_lines: self.rows() as u16,
+                        num_cols: self.cols() as u16,
+                        cell_width: self.cell_width as u16,
+                        cell_height: self.cell_height as u16,
+                    };
+                    self.write_to_pty(formatter(window_size).into_bytes());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn write_to_pty(&self, bytes: Vec<u8>) {
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send(PtyEvent::Input(bytes));
+        }
+    }
+
+    fn color_for_index(&self, index: usize) -> Option<Color32> {
+        match index {
+            0..=255 => Some(self.palette[index].unwrap_or_else(|| {
+                if index < 16 {
+                    ansi_16_color(index as u8)
+                } else {
+                    xterm_256_color(index as u8)
+                }
+            })),
+            256 => Some(self.default_fg),
+            257 => Some(self.default_bg),
+            258 => Some(Color32::WHITE),
+            259..=266 => Some(ansi_16_color((index - 259) as u8)),
+            267 => Some(self.default_fg),
+            268 => Some(self.default_bg),
+            _ => None,
+        }
     }
 
     /// Check if there are any changes since the last render
@@ -527,5 +622,91 @@ mod tests {
         // New output while scrolled up must not yank the view to the bottom.
         grid.process_pty_bytes(b"f\r\n");
         assert_eq!(grid.get_cell(0, 0).map(|c| c.text), before);
+    }
+
+    #[test]
+    #[ignore = "manual profiling harness"]
+    fn profiling_parse_and_render_stress() {
+        use std::time::Instant;
+
+        let cols = 120usize;
+        let rows = 40usize;
+        let mut grid = TerminalGrid::new(cols, rows);
+
+        // Simulate a full-screen redraw burst after nvim exits (cursor motion + colored text).
+        let mut bytes = Vec::new();
+        for _ in 0..20 {
+            for r in 1..=rows {
+                bytes.extend_from_slice(format!("\x1b[{};1H", r).as_bytes());
+                for c in 0..cols {
+                    let color = 16 + (r * 7 + c * 13) % 230;
+                    bytes.extend_from_slice(format!("\x1b[38;5;{}m", color).as_bytes());
+                    bytes.push(b'x');
+                }
+                bytes.extend_from_slice(b"\x1b[0m");
+            }
+        }
+        bytes.extend_from_slice(b"\x1b[?1049l\x1b[2J\x1b[H");
+        // Add some typical statusline/alternate-screen restore noise.
+        for _ in 0..rows {
+            bytes.extend_from_slice(b"\x1b[K\x1b[38;5;250m\x1b[48;5;235m \x1b[0m\r\n");
+        }
+
+        let t0 = Instant::now();
+        for _ in 0..100 {
+            grid.process_pty_bytes(&bytes);
+        }
+        let parse_dur = t0.elapsed();
+
+        let t1 = Instant::now();
+        let mut total_runs = 0usize;
+        for _ in 0..1000 {
+            for row in 0..grid.rows() {
+                total_runs += grid.row_runs(row).len();
+            }
+        }
+        let render_dur = t1.elapsed();
+
+        eprintln!(
+            "profile: rows={} cols={} bytes={} parse100={:?} render1000_full={:?} total_runs={}",
+            rows,
+            cols,
+            bytes.len(),
+            parse_dur,
+            render_dur,
+            total_runs
+        );
+        assert!(total_runs > 0);
+    }
+
+    #[test]
+    fn terminal_queries_are_written_back_to_pty() {
+        use std::sync::mpsc::channel;
+
+        let (tx, rx) = channel::<PtyEvent>();
+        let mut grid = TerminalGrid::new_with_pty_size(4, 2, tx, 1.0, 1.0);
+
+        // Primary device attributes / DSR responses are written back to the PTY.
+        grid.process_pty_bytes(b"\x1b[5n");
+        match rx.try_recv() {
+            Ok(PtyEvent::Input(bytes)) => assert_eq!(bytes, b"\x1b[0n"),
+            Ok(_) => panic!("expected DSR response, got non-input event"),
+            Err(e) => panic!("expected DSR response, got {e:?}"),
+        }
+
+        // OSC 11 (background color) queries must be answered, or nvim hangs on exit.
+        grid.process_pty_bytes(b"\x1b]11;?\x07");
+        match rx.try_recv() {
+            Ok(PtyEvent::Input(bytes)) => {
+                assert!(
+                    bytes.starts_with(b"\x1b]11;rgb:"),
+                    "unexpected OSC 11 response: {bytes:?}"
+                );
+            }
+            Ok(_) => panic!("expected OSC 11 response, got non-input event"),
+            Err(e) => panic!("expected OSC 11 response, got {e:?}"),
+        }
+
+        assert!(rx.try_recv().is_err(), "expected no extra PTY writes");
     }
 }
