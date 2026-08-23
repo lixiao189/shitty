@@ -159,21 +159,31 @@ impl TerminalViewState {
         }
     }
 
-    /// Copy/clear shortcuts that belong to the selection. Returns true when
-    /// the event was consumed instead of being sent to the shell.
-    fn handle_selection_key(&mut self, event: &NSEvent) -> bool {
+    /// Clipboard shortcuts (⌘C copy / ⌘V paste, ESC cancels selection).
+    /// Returns true when consumed.
+    ///
+    /// ⌘C is always consumed: with a selection it copies, otherwise it sends
+    /// ^C to interrupt (AppKit's key binding would swallow it as `copy:`).
+    fn handle_clipboard_key(&mut self, event: &NSEvent) -> bool {
         let characters = event
             .charactersIgnoringModifiers()
             .map(|s| s.to_string())
             .unwrap_or_default();
+        let has_command = event
+            .modifierFlags()
+            .contains(NSEventModifierFlags::Command);
 
-        if characters.eq_ignore_ascii_case("c")
-            && event
-                .modifierFlags()
-                .contains(NSEventModifierFlags::Command)
-            && self.selection.is_some()
-        {
-            self.copy_selection();
+        if has_command && characters.eq_ignore_ascii_case("c") {
+            if self.selection.is_some() {
+                self.copy_selection();
+            } else {
+                self.send_input(vec![0x03]);
+            }
+            return true;
+        }
+
+        if has_command && characters.eq_ignore_ascii_case("v") {
+            self.paste_from_pasteboard();
             return true;
         }
 
@@ -199,6 +209,22 @@ impl TerminalViewState {
         unsafe {
             pasteboard.setString_forType(&ns_text, NSPasteboardTypeString);
         }
+    }
+
+    /// Paste the general pasteboard's text into the shell.
+    fn paste_from_pasteboard(&mut self) {
+        let text = autoreleasepool(|pool| {
+            let pasteboard = NSPasteboard::generalPasteboard();
+            let ns_text = unsafe { pasteboard.stringForType(NSPasteboardTypeString) }?;
+            let text = unsafe { ns_text.to_str(pool).to_string() };
+            (!text.is_empty()).then_some(text)
+        });
+        let Some(text) = text else {
+            return;
+        };
+        let mut input_bytes = Vec::new();
+        keymap::append_paste_text(&text, &mut input_bytes);
+        self.send_input(input_bytes);
     }
 
     fn cursor_cell_rect(&self, bounds: NSRect) -> NSRect {
@@ -330,7 +356,7 @@ define_class!(
         fn key_down(&self, event: &NSEvent) {
             let state_ptr = self.ivars().state;
             if let Some(state) = unsafe { state_ptr.as_mut() } {
-                if state.handle_selection_key(event) {
+                if state.handle_clipboard_key(event) {
                     self.setNeedsDisplay(true);
                     return;
                 }
@@ -548,6 +574,16 @@ define_class!(
                     "scrollPageDown:" => {
                         state.scroll_by_lines(-(state.grid.rows() as isize));
                         self.setNeedsDisplay(true);
+                        return;
+                    }
+                    // Fallbacks for AppKit routing ⌘C/⌘V here directly.
+                    "paste:" => {
+                        state.paste_from_pasteboard();
+                        self.setNeedsDisplay(true);
+                        return;
+                    }
+                    "copy:" => {
+                        state.copy_selection();
                         return;
                     }
                     _ => {}
@@ -771,14 +807,14 @@ define_class!(
             // current width must be processed at that width, otherwise a
             // shell redraw can wrap at a smaller grid and leave duplicates.
             // The byte cap keeps a giant redraw burst from freezing the main thread.
-            let mut received_data = false;
+            // Note: don't clear the selection on output — ⌘C copy would fail
+            // while command output is still draining.
             let mut processed_bytes = 0usize;
             while processed_bytes < MAX_PTY_BYTES_PER_TICK {
                 match state.rx_output.try_recv() {
                     Ok(bytes) => {
                         processed_bytes += bytes.len();
                         state.grid.process_pty_bytes(&bytes);
-                        received_data = true;
                     }
                     Err(_) => break,
                 }
@@ -787,11 +823,6 @@ define_class!(
             if state.rx_exit.try_recv().is_ok() {
                 self.ivars().view.close_window();
                 return;
-            }
-
-            if received_data {
-                // The grid contents changed, so a stale highlight no longer matches.
-                state.selection = None;
             }
 
             // Apply a debounced resize once the drag settles: the grid and

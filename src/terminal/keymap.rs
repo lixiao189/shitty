@@ -36,6 +36,27 @@ pub mod macos_keymap {
         out.extend_from_slice(text.as_bytes());
     }
 
+    /// Paste text as shell input: CRLF/LF → CR, NUL stripped.
+    pub(crate) fn append_paste_text(text: &str, out: &mut Vec<u8>) {
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    out.push(b'\r');
+                }
+                '\n' => out.push(b'\r'),
+                '\0' => {}
+                _ => {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+        }
+    }
+
     /// Map the unmodified character of a key to the control byte the shell
     /// expects for a Control+key press (^C = 0x03, ^D = 0x04, ^[ = ESC, ...).
     /// Follows the same table as xterm/Terminal.app for digit and symbol keys.
@@ -116,6 +137,28 @@ pub mod macos_keymap {
             out.clear();
             append_input_from_text("hello", &mut out);
             assert_eq!(out, b"hello");
+        }
+
+        #[test]
+        fn paste_text_normalizes_line_endings_and_drops_nul() {
+            let mut out = Vec::new();
+            append_paste_text("a\r\nb\nc\rd\0e", &mut out);
+            assert_eq!(out, b"a\rb\rc\rde");
+
+            out.clear();
+            append_paste_text("", &mut out);
+            assert!(out.is_empty());
+
+            out.clear();
+            append_paste_text("trailing\n", &mut out);
+            assert_eq!(out, b"trailing\r");
+        }
+
+        #[test]
+        fn paste_text_keeps_multibyte_chars() {
+            let mut out = Vec::new();
+            append_paste_text("文\r\nx", &mut out);
+            assert_eq!(out.as_slice(), "文\rx".as_bytes());
         }
 
         #[test]
