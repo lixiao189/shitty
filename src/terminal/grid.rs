@@ -5,7 +5,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::{Flags, LineLength};
 use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
+use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor, Rgb};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
@@ -409,12 +409,14 @@ impl TerminalGrid {
             cell_fg
         };
         let fg = if bg == cell_bg { cell_fg } else { cell_bg };
+        let shape = self.term.cursor_style().shape; // Shape set by the application via DECSCUSR.
         Some(CursorInfo {
             row,
             col,
             text,
             fg,
             bg,
+            shape,
         })
     }
 
@@ -476,6 +478,7 @@ pub(crate) struct CursorInfo {
     pub text: String,
     pub fg: Color32,
     pub bg: Color32,
+    pub shape: CursorShape,
 }
 
 #[cfg(test)]
@@ -547,6 +550,29 @@ mod tests {
         let mut grid = TerminalGrid::new(4, 1);
         grid.process_pty_bytes(b"\x1b[?25l");
         assert!(grid.cursor().is_none());
+    }
+
+    #[test]
+    fn cursor_shape_follows_decscusr() {
+        let mut grid = TerminalGrid::new(8, 2);
+
+        // Steady bar: what nvim sends when entering insert mode.
+        grid.process_pty_bytes(b"\x1b[6 q");
+        assert_eq!(grid.cursor().unwrap().shape, CursorShape::Beam);
+
+        // Blinking variants share the same shape.
+        grid.process_pty_bytes(b"\x1b[5 q");
+        assert_eq!(grid.cursor().unwrap().shape, CursorShape::Beam);
+
+        // Steady underline.
+        grid.process_pty_bytes(b"\x1b[4 q");
+        assert_eq!(grid.cursor().unwrap().shape, CursorShape::Underline);
+
+        // Back to block, then reset (0) returns to the default shape.
+        grid.process_pty_bytes(b"\x1b[2 q");
+        assert_eq!(grid.cursor().unwrap().shape, CursorShape::Block);
+        grid.process_pty_bytes(b"\x1b[0 q");
+        assert_eq!(grid.cursor().unwrap().shape, CursorShape::Block);
     }
 
     #[cfg(target_os = "macos")]

@@ -25,6 +25,7 @@ cargo test           # run all inline unit tests
 
 - Follow `rustfmt` defaults and keep `cargo clippy` clean (no project-specific config files exist).
 - Use standard Rust naming: `snake_case` for functions and variables, `UpperCamelCase` for types, `SCREAMING_SNAKE_CASE` for constants.
+- Comment variables with a trailing comment after the definition, not above it (e.g. `let shape = ...; // shape set via DECSCUSR`). Doc comments (`///`) on types, functions, and struct fields stay above the item.
 - Prefer small, focused modules; keep platform-specific code behind the entry-point routing in `main.rs`.
 
 ## Testing Guidelines

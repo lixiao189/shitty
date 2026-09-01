@@ -20,16 +20,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let pty = Pty::spawn()?;
     let (tx_pty_output, rx_pty_output) = channel::<Vec<u8>>();
     let (tx_pty_input, rx_pty_input) = channel::<PtyEvent>();
-    let (tx_pty_exit, rx_pty_exit) = channel::<()>();
-    // The AppKit timer polls `rx_pty_output`, so no extra repaint wake-up is needed.
-    pty.spawn_threads(
-        tx_pty_output,
-        rx_pty_input,
-        || {},
-        move || {
-            let _ = tx_pty_exit.send(());
-        },
-    );
 
     let mtm = MainThreadMarker::new().ok_or("must be on main thread")?;
     let app = NSApplication::sharedApplication(mtm);
@@ -41,8 +31,26 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let delegate = ShittyAppDelegate::new(mtm, rx_pty_output, tx_pty_input, rx_pty_exit);
+    let delegate = ShittyAppDelegate::new(mtm, rx_pty_output, tx_pty_input);
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+
+    // PTY output and exit events wake the view on the main thread. Output
+    // bursts are coalesced before the grid is drained and redrawn.
+    let wake = delegate
+        .ivars()
+        .terminal_view
+        .borrow()
+        .as_ref()
+        .cloned()
+        .expect("terminal view initialized before launch")
+        .view_wake_handle();
+    let exit_wake = wake.clone();
+    pty.spawn_threads(
+        tx_pty_output,
+        rx_pty_input,
+        move || wake.signal_output(),
+        move || exit_wake.signal_exit(),
+    );
 
     app.run();
     Ok(())
@@ -150,9 +158,8 @@ impl ShittyAppDelegate {
         mtm: MainThreadMarker,
         rx_output: Receiver<Vec<u8>>,
         tx_input: Sender<PtyEvent>,
-        rx_exit: Receiver<()>,
     ) -> Retained<Self> {
-        let view_state = terminal_view_state(rx_output, tx_input, rx_exit);
+        let view_state = terminal_view_state(rx_output, tx_input);
         let this = Self::alloc(mtm).set_ivars(AppDelegateIvars::new(mtm, view_state));
         unsafe { msg_send![super(this), init] }
     }
@@ -161,11 +168,10 @@ impl ShittyAppDelegate {
 fn terminal_view_state(
     rx_output: Receiver<Vec<u8>>,
     tx_input: Sender<PtyEvent>,
-    rx_exit: Receiver<()>,
 ) -> TerminalViewState {
     let font = load_terminal_font(DEFAULT_FONT_SIZE);
     let (cell_width, cell_height) = measure_cell_size(&font);
-    TerminalViewState::new(rx_output, tx_input, rx_exit, font, cell_width, cell_height)
+    TerminalViewState::new(rx_output, tx_input, font, cell_width, cell_height)
 }
 
 struct AppDelegateIvars {

@@ -2,11 +2,14 @@ use crate::terminal::color::{Color32, SELECTION_BG};
 use crate::terminal::grid::{CellPos, TerminalGrid};
 use crate::terminal::keymap;
 use crate::terminal::pty::PtyEvent;
-use crate::terminal::resize::ResizeDebouncer;
+use crate::terminal::resize::{RESIZE_DEBOUNCE_DELAY, ResizeDebouncer};
 use crate::terminal::selection::Selection;
+use alacritty_terminal::vte::ansi::CursorShape;
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{AnyObject, Bool, ProtocolObject, Sel};
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+use objc2::{
+    AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
+};
 use objc2_app_kit::{
     NSBezierPath, NSColor, NSEvent, NSEventModifierFlags, NSFont, NSFontAttributeName,
     NSForegroundColorAttributeName, NSPasteboard, NSPasteboardTypeString, NSStringDrawing,
@@ -14,20 +17,140 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{
     NSArray, NSAttributedString, NSAttributedStringKey, NSDictionary, NSMutableDictionary,
-    NSNotFound, NSPoint, NSRange, NSRect, NSSize, NSString, NSTimer, NSUInteger,
+    NSNotFound, NSObject, NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize, NSString, NSUInteger,
 };
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::time::{Duration, Instant};
 
 use super::cast_any_object;
 use super::font::{
     DEFAULT_FONT_SIZE, FONT_SIZE_STEP, clamp_font_size, load_terminal_font, measure_cell_size,
 };
 
-/// Refresh rate for the terminal rendering timer (in Hz).
-const RENDER_REFRESH_RATE_HZ: f64 = 120.0;
+/// Coalescing window for bursts of PTY output.
+const OUTPUT_DEBOUNCE_DELAY: Duration = Duration::from_millis(8);
+/// Cap on PTY bytes parsed per event so a huge burst never freezes the main thread.
+const MAX_PTY_BYTES_PER_DRAIN: usize = 256 * 1024;
 
-/// Cap on PTY bytes parsed per render tick, so a huge redraw burst never freezes the main thread.
-const MAX_PTY_BYTES_PER_TICK: usize = 256 * 1024;
+/// Objective-C target used to bridge background PTY events onto the main run loop.
+/// It uses only Foundation selectors, avoiding a separate dispatch dependency.
+pub(super) struct ViewWakeIvars {
+    output_pending: AtomicBool,
+    exit_pending: AtomicBool,
+    view: AtomicPtr<ShittyTerminalView>,
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = AnyThread]
+    #[ivars = ViewWakeIvars]
+    pub(super) struct ViewWake;
+
+    unsafe impl NSObjectProtocol for ViewWake {}
+
+    impl ViewWake {
+        #[unsafe(method(scheduleOutputDrain:))]
+        fn schedule_output_drain(&self, _sender: Option<&AnyObject>) {
+            unsafe {
+                let _: () = msg_send![
+                    self,
+                    performSelector: sel!(drainOutput:),
+                    withObject: None::<&AnyObject>,
+                    afterDelay: OUTPUT_DEBOUNCE_DELAY.as_secs_f64()
+                ];
+            }
+        }
+
+        #[unsafe(method(drainOutput:))]
+        fn drain_output(&self, _sender: Option<&AnyObject>) {
+            self.ivars().output_pending.store(false, Ordering::Release);
+            let view = self.ivars().view.load(Ordering::Acquire);
+            if let Some(view) = unsafe { Retained::retain(view) }
+                && view.pty_output_ready()
+            {
+                self.signal_output();
+            }
+        }
+
+        #[unsafe(method(sessionExited:))]
+        fn session_exited(&self, _sender: Option<&AnyObject>) {
+            let view = self.ivars().view.load(Ordering::Acquire);
+            if let Some(view) = unsafe { Retained::retain(view) } {
+                view.close_window();
+            }
+        }
+
+        #[unsafe(method(resizeDebounceReady:))]
+        fn resize_debounce_ready(&self, _sender: Option<&AnyObject>) {
+            let view = self.ivars().view.load(Ordering::Acquire);
+            if let Some(view) = unsafe { Retained::retain(view) } {
+                view.resize_debounce_ready();
+            }
+        }
+    }
+);
+
+impl ViewWake {
+    fn new() -> Retained<Self> {
+        let this = Self::alloc().set_ivars(ViewWakeIvars {
+            output_pending: AtomicBool::new(false),
+            exit_pending: AtomicBool::new(false),
+            view: AtomicPtr::new(std::ptr::null_mut()),
+        });
+        unsafe { msg_send![super(this), init] }
+    }
+
+    fn attach(&self, view: *mut ShittyTerminalView) {
+        self.ivars().view.store(view, Ordering::Release);
+    }
+
+    fn detach(&self) {
+        self.ivars()
+            .view
+            .store(std::ptr::null_mut(), Ordering::Release);
+    }
+
+    /// Coalesce output events and drain them on the main run loop after 8 ms.
+    pub(super) fn signal_output(&self) {
+        if !self.ivars().output_pending.swap(true, Ordering::AcqRel) {
+            unsafe {
+                let _: () = msg_send![
+                    self,
+                    performSelectorOnMainThread: sel!(scheduleOutputDrain:),
+                    withObject: None::<&AnyObject>,
+                    waitUntilDone: false
+                ];
+            }
+        }
+    }
+
+    /// Deliver shell exit immediately and at most once on the main thread.
+    pub(super) fn signal_exit(&self) {
+        if !self.ivars().exit_pending.swap(true, Ordering::AcqRel) {
+            unsafe {
+                let _: () = msg_send![
+                    self,
+                    performSelectorOnMainThread: sel!(sessionExited:),
+                    withObject: None::<&AnyObject>,
+                    waitUntilDone: false
+                ];
+            }
+        }
+    }
+
+    /// Schedule the single outstanding resize debounce callback.
+    fn schedule_resize(&self, delay: Duration) {
+        unsafe {
+            let _: () = msg_send![
+                self,
+                performSelector: sel!(resizeDebounceReady:),
+                withObject: None::<&AnyObject>,
+                afterDelay: delay.as_secs_f64()
+            ];
+        }
+    }
+}
 
 /// Width of the scrollbar drawn over the right edge of the view.
 const SCROLLBAR_WIDTH: f64 = 12.0;
@@ -38,34 +161,35 @@ const SCROLLBAR_INSET: f64 = 2.0;
 /// Lines scrolled per notch of a non-precise (mouse wheel) event.
 const WHEEL_NOTCH_LINES: f64 = 3.0;
 
-/// Rust-side state shared by the terminal view and its render timer.
+/// Rust-side state owned by the terminal view.
 pub(super) struct TerminalViewState {
     grid: TerminalGrid,
     rx_output: Receiver<Vec<u8>>,
     tx_input: Sender<PtyEvent>,
-    rx_exit: Receiver<()>,
     font: Retained<NSFont>,
     font_size: f64,
     cell_width: f64,
     cell_height: f64,
-    timer: Option<Retained<NSTimer>>,
     marked_text: String,
     ime_composing: bool,
     had_composition: bool,
     skip_next_command: bool,
     selection: Option<Selection>,
     resize_debouncer: ResizeDebouncer,
+    /// Whether one delayed resize callback is already queued.
+    resize_task_scheduled: bool,
     /// Fractional scroll-wheel delta waiting to be applied to the grid.
     scroll_accum: f64,
     /// Whether the scrollbar thumb is being dragged.
     scrollbar_dragging: bool,
+    /// Shared with the PTY reader thread, which signals it when shell output arrives.
+    wake: Retained<ViewWake>,
 }
 
 impl TerminalViewState {
     pub(super) fn new(
         rx_output: Receiver<Vec<u8>>,
         tx_input: Sender<PtyEvent>,
-        rx_exit: Receiver<()>,
         font: Retained<NSFont>,
         cell_width: f64,
         cell_height: f64,
@@ -81,20 +205,20 @@ impl TerminalViewState {
             ),
             rx_output,
             tx_input,
-            rx_exit,
             font,
             font_size,
             cell_width,
             cell_height,
-            timer: None,
             marked_text: String::new(),
             ime_composing: false,
             had_composition: false,
             skip_next_command: false,
             selection: None,
             resize_debouncer: ResizeDebouncer::new(),
+            resize_task_scheduled: false,
             scroll_accum: 0.0,
             scrollbar_dragging: false,
+            wake: ViewWake::new(),
         }
     }
 
@@ -286,6 +410,22 @@ impl TerminalViewState {
         NSRect::new(NSPoint::new(x0, y0), NSSize::new(cell_w, cell_h))
     }
 
+    /// Drain pending PTY output into the grid, bounded so a huge redraw burst
+    /// never stalls the main thread for long.
+    fn drain_pty_output(&mut self) -> bool {
+        let mut processed_bytes = 0usize;
+        while processed_bytes < MAX_PTY_BYTES_PER_DRAIN {
+            match self.rx_output.try_recv() {
+                Ok(bytes) => {
+                    processed_bytes += bytes.len();
+                    self.grid.process_pty_bytes(&bytes);
+                }
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+
     fn marked_text_range(&self) -> NSRange {
         if self.marked_text.is_empty() {
             return NSRange::new(NSNotFound as NSUInteger, 0);
@@ -297,9 +437,9 @@ impl TerminalViewState {
 
 impl Drop for TerminalViewState {
     fn drop(&mut self) {
-        if let Some(timer) = self.timer.take() {
-            timer.invalidate();
-        }
+        // Null the wake handle first so queued main-queue wake-ups can never
+        // reach a dangling view pointer.
+        self.wake.detach();
     }
 }
 
@@ -522,27 +662,64 @@ define_class!(
                     origin.y + bounds.size.height - (cursor.row as f64 * state.cell_height),
                     scale,
                 );
-                let cursor_rect = NSRect::new(
-                    NSPoint::new(cursor_x0, cursor_y0),
-                    NSSize::new(
-                        (cursor_x1 - cursor_x0).max(0.0),
-                        (cursor_y1 - cursor_y0).max(0.0),
-                    ),
-                );
-                let cursor_bg_color = to_nscolor(cursor.bg);
-                let cursor_fg_color = to_nscolor(cursor.fg);
-                cursor_bg_color.set();
-                NSBezierPath::fillRect(cursor_rect);
+                let cell_w = (cursor_x1 - cursor_x0).max(0.0);
+                let cell_h = (cursor_y1 - cursor_y0).max(0.0);
+                let cursor_paint_color = to_nscolor(cursor.bg);
+                cursor_paint_color.set();
 
-                let cursor_rect_h = (cursor_y1 - cursor_y0).max(0.0);
-                let font_height = state.font.ascender() - state.font.descender();
-                let text_pos = NSPoint::new(
-                    cursor_x0,
-                    snap_to_pixel(cursor_y0 + (cursor_rect_h - font_height) / 2.0, scale),
-                );
-                let text = NSString::from_str(&cursor.text);
-                let text_attrs = text_attributes(&state.font, &cursor_fg_color);
-                unsafe { text.drawAtPoint_withAttributes(text_pos, Some(&text_attrs)) };
+                match cursor.shape {
+                    CursorShape::Block => {
+                        NSBezierPath::fillRect(NSRect::new(
+                            NSPoint::new(cursor_x0, cursor_y0),
+                            NSSize::new(cell_w, cell_h),
+                        ));
+                        if !cursor.text.is_empty() {
+                            let font_height = state.font.ascender() - state.font.descender();
+                            let text_pos = NSPoint::new(
+                                cursor_x0,
+                                snap_to_pixel(cursor_y0 + (cell_h - font_height) / 2.0, scale),
+                            );
+                            let text = NSString::from_str(&cursor.text);
+                            let text_color = to_nscolor(cursor.fg);
+                            let text_attrs = text_attributes(&state.font, &text_color);
+                            unsafe { text.drawAtPoint_withAttributes(text_pos, Some(&text_attrs)) };
+                        }
+                    }
+                    CursorShape::Beam => {
+                        let bar_width = snap_to_pixel((cell_w / 6.0).max(1.0), scale);
+                        NSBezierPath::fillRect(NSRect::new(
+                            NSPoint::new(cursor_x0, cursor_y0),
+                            NSSize::new(bar_width, cell_h),
+                        ));
+                    }
+                    CursorShape::Underline => {
+                        let bar_height = snap_to_pixel((cell_h / 8.0).max(1.0), scale);
+                        NSBezierPath::fillRect(NSRect::new(
+                            NSPoint::new(cursor_x0, cursor_y0),
+                            NSSize::new(cell_w, bar_height),
+                        ));
+                    }
+                    CursorShape::HollowBlock => {
+                        let thickness = snap_to_pixel(1.0, scale);
+                        NSBezierPath::fillRect(NSRect::new(
+                            NSPoint::new(cursor_x0, cursor_y0),
+                            NSSize::new(cell_w, thickness),
+                        ));
+                        NSBezierPath::fillRect(NSRect::new(
+                            NSPoint::new(cursor_x0, cursor_y1 - thickness),
+                            NSSize::new(cell_w, thickness),
+                        ));
+                        NSBezierPath::fillRect(NSRect::new(
+                            NSPoint::new(cursor_x0, cursor_y0),
+                            NSSize::new(thickness, cell_h),
+                        ));
+                        NSBezierPath::fillRect(NSRect::new(
+                            NSPoint::new(cursor_x1 - thickness, cursor_y0),
+                            NSSize::new(thickness, cell_h),
+                        ));
+                    }
+                    CursorShape::Hidden => {}
+                }
             }
 
             if !state.marked_text.is_empty() {
@@ -757,35 +934,25 @@ define_class!(
 impl ShittyTerminalView {
     pub(super) fn new(mtm: MainThreadMarker, state: TerminalViewState) -> Retained<Self> {
         let state_ptr = Box::into_raw(Box::new(state));
-        let this = Self::alloc(mtm).set_ivars(TerminalViewIvars { state: state_ptr });
+        let wake = unsafe { (*state_ptr).wake.clone() };
+        let this = Self::alloc(mtm).set_ivars(TerminalViewIvars {
+            state: state_ptr,
+            wake,
+        });
         let view: Retained<Self> = unsafe {
             msg_send![
                 super(this),
                 initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 600.0))
             ]
         };
-        let timer_target = TimerTarget::new(mtm, &view);
-        let timer = unsafe {
-            NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
-                1.0 / RENDER_REFRESH_RATE_HZ,
-                &timer_target,
-                sel!(onTimerTick:),
-                None,
-                true,
-            )
-        };
-        unsafe {
-            if let Some(state) = state_ptr.as_mut() {
-                state.timer = Some(timer);
-            }
-        }
         view.record_grid_size(view.bounds().size);
+        // Register the view with the wake handle so the PTY reader thread can
+        // trigger coalesced drain+redraw passes from now on.
+        view.ivars().wake.attach(Retained::as_ptr(&view).cast_mut());
         view
     }
 
-    /// Record a window size change. The grid and PTY are resized together on
-    /// the render timer once the size has been stable, so the shell's redraw
-    /// is always processed at the width it was generated for.
+    /// Record a window size change and schedule one trailing debounce callback.
     fn record_grid_size(&self, size: NSSize) {
         let state_ptr = self.ivars().state;
         if state_ptr.is_null() {
@@ -794,16 +961,68 @@ impl ShittyTerminalView {
         let state = unsafe { &mut *state_ptr };
         let cols = ((size.width / state.cell_width).floor() as usize).max(1);
         let rows = ((size.height / state.cell_height).floor() as usize).max(1);
-        if state.resize_debouncer.record(cols, rows) {
-            // The very first size is applied right away so the shell starts
-            // with a sane terminal size; there is no prior redraw to race.
-            if !state.resize_debouncer.has_sent()
-                && let Some((cols, rows)) = state.resize_debouncer.take_now()
-                && state.grid.resize(cols, rows)
-            {
-                state.send_resize(cols, rows);
+        if !state.resize_debouncer.record(cols, rows, Instant::now()) {
+            return;
+        }
+
+        // The first size is safe to apply immediately because no shell redraw
+        // for a previous width can still be in flight.
+        if !state.resize_debouncer.has_sent() {
+            if let Some((cols, rows)) = state.resize_debouncer.take_now() {
+                Self::apply_grid_size(state, cols, rows);
             }
+        } else if !state.resize_task_scheduled {
+            state.resize_task_scheduled = true;
+            state.wake.schedule_resize(RESIZE_DEBOUNCE_DELAY);
+        }
+        self.setNeedsDisplay(true);
+    }
+
+    /// Run the one outstanding resize callback, rescheduling only when a newer
+    /// frame event pushed the trailing deadline farther out.
+    fn resize_debounce_ready(&self) {
+        let state_ptr = self.ivars().state;
+        let Some(state) = (unsafe { state_ptr.as_mut() }) else {
+            return;
+        };
+        state.resize_task_scheduled = false;
+
+        // Process output generated for the old width before changing both the
+        // grid and PTY. If the byte budget is exhausted, continue in another
+        // event and retry the resize afterwards.
+        let needs_output_follow_up = state.drain_pty_output();
+        self.redraw_grid_if_changed(state);
+        if needs_output_follow_up {
+            state.wake.signal_output();
+            state.resize_task_scheduled = true;
+            state.wake.schedule_resize(OUTPUT_DEBOUNCE_DELAY);
+            return;
+        }
+
+        let now = Instant::now();
+        if let Some((cols, rows)) = state.resize_debouncer.take_ready(now) {
+            Self::apply_grid_size(state, cols, rows);
+            self.redraw_grid_if_changed(state);
+        } else if let Some(delay) = state.resize_debouncer.remaining_delay(now) {
+            state.resize_task_scheduled = true;
+            state.wake.schedule_resize(delay);
+        }
+    }
+
+    fn apply_grid_size(state: &mut TerminalViewState, cols: usize, rows: usize) {
+        if state.grid.resize(cols, rows) {
+            state.send_resize(cols, rows);
+            state.selection = None;
+        } else {
+            // Grid already has this size; make sure the PTY knows too.
+            state.send_resize(cols, rows);
+        }
+    }
+
+    fn redraw_grid_if_changed(&self, state: &mut TerminalViewState) {
+        if state.grid.has_changes() {
             self.setNeedsDisplay(true);
+            state.grid.mark_rendered();
         }
     }
 
@@ -812,6 +1031,24 @@ impl ShittyTerminalView {
         if let Some(window) = self.window() {
             window.performClose(None);
         }
+    }
+
+    /// Drain a bounded PTY output batch and request a redraw. Returns true
+    /// when another event is needed to continue draining a large burst.
+    fn pty_output_ready(&self) -> bool {
+        let state_ptr = self.ivars().state;
+        if state_ptr.is_null() {
+            return false;
+        }
+        let state = unsafe { &mut *state_ptr };
+        let needs_follow_up = state.drain_pty_output();
+        self.redraw_grid_if_changed(state);
+        needs_follow_up
+    }
+
+    /// The event bridge shared with the PTY reader thread.
+    pub(super) fn view_wake_handle(&self) -> Retained<ViewWake> {
+        self.ivars().wake.clone()
     }
 
     /// Convert a mouse event into a snapped grid cell.
@@ -834,87 +1071,18 @@ impl ShittyTerminalView {
 
 pub(super) struct TerminalViewIvars {
     state: *mut TerminalViewState,
+    /// Clone of the event bridge inside the state, for the PTY reader thread.
+    wake: Retained<ViewWake>,
 }
 
 // Drop impl ensures the boxed TerminalViewState is freed when the ObjC view
-// is deallocated by ARC, which also triggers TerminalViewState::drop() which
-// invalidates the NSTimer and breaks the retain cycle.
+// is deallocated by ARC, which also detaches queued event callbacks.
 impl Drop for TerminalViewIvars {
     fn drop(&mut self) {
         if !self.state.is_null() {
             unsafe { drop(Box::from_raw(self.state)) };
             self.state = std::ptr::null_mut();
         }
-    }
-}
-
-define_class!(
-    #[unsafe(super(objc2_foundation::NSObject))]
-    #[thread_kind = objc2::MainThreadOnly]
-    #[ivars = TimerTargetIvars]
-    struct TimerTarget;
-
-    impl TimerTarget {
-        #[unsafe(method(onTimerTick:))]
-        fn on_timer_tick(&self, _timer: &NSTimer) {
-            let state_ptr = self.ivars().view.ivars().state;
-            if state_ptr.is_null() {
-                return;
-            }
-            let state = unsafe { &mut *state_ptr };
-
-            // Drain pending output before resizing: bytes written for the
-            // current width must be processed at that width, otherwise a
-            // shell redraw can wrap at a smaller grid and leave duplicates.
-            // The byte cap keeps a giant redraw burst from freezing the main thread.
-            // Note: don't clear the selection on output — ⌘C copy would fail
-            // while command output is still draining.
-            let mut processed_bytes = 0usize;
-            while processed_bytes < MAX_PTY_BYTES_PER_TICK {
-                match state.rx_output.try_recv() {
-                    Ok(bytes) => {
-                        processed_bytes += bytes.len();
-                        state.grid.process_pty_bytes(&bytes);
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            if state.rx_exit.try_recv().is_ok() {
-                self.ivars().view.close_window();
-                return;
-            }
-
-            // Apply a debounced resize once the drag settles: the grid and
-            // PTY move together, so the shell only redraws once at the final
-            // size and that redraw is processed at the matching width.
-            if let Some((cols, rows)) = state.resize_debouncer.take_stable() {
-                if state.grid.resize(cols, rows) {
-                    state.send_resize(cols, rows);
-                    // The grid geometry changed, so the selection no longer fits.
-                    state.selection = None;
-                } else {
-                    // Grid already at this size; make sure the PTY knows too.
-                    state.send_resize(cols, rows);
-                }
-            }
-
-            if state.grid.has_changes() {
-                self.ivars().view.setNeedsDisplay(true);
-                state.grid.mark_rendered();
-            }
-        }
-    }
-);
-
-struct TimerTargetIvars {
-    view: Retained<ShittyTerminalView>,
-}
-
-impl TimerTarget {
-    fn new(mtm: MainThreadMarker, view: &Retained<ShittyTerminalView>) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(TimerTargetIvars { view: view.clone() });
-        unsafe { msg_send![super(this), init] }
     }
 }
 
