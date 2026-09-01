@@ -13,6 +13,20 @@ use std::sync::OnceLock;
 
 use super::cast_any_object;
 
+/// Font size at startup.
+pub(super) const DEFAULT_FONT_SIZE: f64 = 14.0;
+/// Font size step per zoom keystroke (⌘+/⌘−).
+pub(super) const FONT_SIZE_STEP: f64 = 1.0;
+/// Smallest font size reachable by zooming out.
+pub(super) const MIN_FONT_SIZE: f64 = 6.0;
+/// Largest font size reachable by zooming in.
+pub(super) const MAX_FONT_SIZE: f64 = 40.0;
+
+/// Clamp a requested font size to the supported zoom range.
+pub(super) fn clamp_font_size(size: f64) -> f64 {
+    size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+}
+
 pub(super) fn load_terminal_font(size: f64) -> Retained<NSFont> {
     // Best-effort: make the bundled font usable even when not installed system-wide.
     let embedded_postscript_names = embedded_monaco_postscript_names();
@@ -132,5 +146,12 @@ mod tests {
                 || name.contains("MonacoNFM"),
             "expected Monaco Nerd Font Mono, got: {name}"
         );
+    }
+
+    #[test]
+    fn clamp_font_size_limits_zoom_range() {
+        assert_eq!(clamp_font_size(14.0), 14.0);
+        assert_eq!(clamp_font_size(MIN_FONT_SIZE - 10.0), MIN_FONT_SIZE);
+        assert_eq!(clamp_font_size(MAX_FONT_SIZE + 10.0), MAX_FONT_SIZE);
     }
 }

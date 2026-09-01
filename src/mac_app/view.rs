@@ -19,6 +19,9 @@ use objc2_foundation::{
 use std::sync::mpsc::{Receiver, Sender};
 
 use super::cast_any_object;
+use super::font::{
+    DEFAULT_FONT_SIZE, FONT_SIZE_STEP, clamp_font_size, load_terminal_font, measure_cell_size,
+};
 
 /// Refresh rate for the terminal rendering timer (in Hz).
 const RENDER_REFRESH_RATE_HZ: f64 = 120.0;
@@ -42,6 +45,7 @@ pub(super) struct TerminalViewState {
     tx_input: Sender<PtyEvent>,
     rx_exit: Receiver<()>,
     font: Retained<NSFont>,
+    font_size: f64,
     cell_width: f64,
     cell_height: f64,
     timer: Option<Retained<NSTimer>>,
@@ -66,6 +70,7 @@ impl TerminalViewState {
         cell_width: f64,
         cell_height: f64,
     ) -> Self {
+        let font_size = font.pointSize();
         Self {
             grid: TerminalGrid::new_with_pty_size(
                 80,
@@ -78,6 +83,7 @@ impl TerminalViewState {
             tx_input,
             rx_exit,
             font,
+            font_size,
             cell_width,
             cell_height,
             timer: None,
@@ -193,6 +199,50 @@ impl TerminalViewState {
         }
 
         false
+    }
+
+    /// Font zoom shortcuts (⌘+/⌘− steps the size, ⌘0 resets to default).
+    /// Returns true when the key was consumed.
+    fn handle_zoom_key(&mut self, event: &NSEvent) -> bool {
+        if !event
+            .modifierFlags()
+            .contains(NSEventModifierFlags::Command)
+        {
+            return false;
+        }
+        let characters = event
+            .charactersIgnoringModifiers()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let step = match characters.as_str() {
+            "=" | "+" => FONT_SIZE_STEP,
+            "-" | "_" => -FONT_SIZE_STEP,
+            "0" => {
+                self.change_font_size(DEFAULT_FONT_SIZE);
+                return true;
+            }
+            _ => return false,
+        };
+        self.change_font_size(self.font_size + step);
+        true
+    }
+
+    /// Rebuild the font and cell metrics for a new size; the grid reflow and
+    /// PTY resize are driven by the caller through `record_grid_size`.
+    fn change_font_size(&mut self, size: f64) {
+        let size = clamp_font_size(size);
+        if (size - self.font_size).abs() < f64::EPSILON {
+            return;
+        }
+        let font = load_terminal_font(size);
+        let (cell_width, cell_height) = measure_cell_size(&font);
+        self.font = font;
+        self.font_size = size;
+        self.cell_width = cell_width;
+        self.cell_height = cell_height;
+        self.grid.set_cell_size(cell_width, cell_height);
+        // The selection is stored in cell coordinates, so it no longer fits.
+        self.selection = None;
     }
 
     fn copy_selection(&self) {
@@ -357,6 +407,16 @@ define_class!(
             let state_ptr = self.ivars().state;
             if let Some(state) = unsafe { state_ptr.as_mut() } {
                 if state.handle_clipboard_key(event) {
+                    self.setNeedsDisplay(true);
+                    return;
+                }
+                // Font zoom shortcuts (⌘+/⌘−/⌘0) are handled here rather
+                // than through interpretKeyEvents:, which would ignore them.
+                if !state.ime_composing && state.handle_zoom_key(event) {
+                    // The cell size changed, so re-derive the grid size from
+                    // the (unchanged) view bounds and let the debounced resize
+                    // path reflow the grid and resize the PTY together.
+                    self.record_grid_size(self.bounds().size);
                     self.setNeedsDisplay(true);
                     return;
                 }

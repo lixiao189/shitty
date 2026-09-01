@@ -13,7 +13,7 @@ use objc2_foundation::{NSPoint, NSRect, NSSize, NSString, ns_string};
 use std::cell::RefCell;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use super::font::{load_terminal_font, measure_cell_size};
+use super::font::{DEFAULT_FONT_SIZE, load_terminal_font, measure_cell_size};
 use super::view::{ShittyTerminalView, TerminalViewState};
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -163,7 +163,7 @@ fn terminal_view_state(
     tx_input: Sender<PtyEvent>,
     rx_exit: Receiver<()>,
 ) -> TerminalViewState {
-    let font = load_terminal_font(14.0);
+    let font = load_terminal_font(DEFAULT_FONT_SIZE);
     let (cell_width, cell_height) = measure_cell_size(&font);
     TerminalViewState::new(rx_output, tx_input, rx_exit, font, cell_width, cell_height)
 }

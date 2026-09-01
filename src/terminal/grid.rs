@@ -109,6 +109,14 @@ impl TerminalGrid {
         grid
     }
 
+    /// Update the cell metrics used to answer pixel-size queries
+    /// (e.g. after a font zoom); also flags the grid for redraw.
+    pub(crate) fn set_cell_size(&mut self, cell_width: f64, cell_height: f64) {
+        self.cell_width = cell_width;
+        self.cell_height = cell_height;
+        self.has_changes = true;
+    }
+
     pub(crate) fn rows(&self) -> usize {
         self.term.screen_lines()
     }
