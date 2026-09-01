@@ -30,6 +30,7 @@ cargo build
 cargo build --release
 cargo clippy
 cargo fmt
+cargo test
 ```
 
 Binary output: `target_local/` (see `.cargo/config.toml`).
@@ -40,7 +41,10 @@ Binary output: `target_local/` (see `.cargo/config.toml`).
 - PTY-backed shell (`/bin/zsh`) with proper resize signaling.
 - ANSI 16-color, xterm 256-color, and truecolor RGB support.
 - Wide-character handling and underline rendering.
-- Cursor rendering with inverse and custom cursor color support.
+- Cursor rendering with inverse cell colors and DECSCUSR shape support.
+- 1000-row scrollback with a scrollbar and mouse-wheel scrolling.
+- Mouse text selection with clipboard copy/paste (⌘C/⌘V, ESC clears selection).
+- Font zoom (⌘+/⌘−/⌘0) and IME composition support.
 - macOS AppKit renderer with native key handling.
 - Nerd Font monospace rendering (bundled fonts in `assets/`).
 
@@ -66,7 +70,8 @@ flowchart LR
 
 ## Project Layout
 
-- `src/main.rs`: macOS AppKit entry point.
+- `src/lib.rs`: library root exposing the `mac_app` module.
+- `src/main.rs`: binary entry point calling `shitty::mac_app::run()`.
 - `src/mac_app/`: native AppKit UI — `app.rs` (bootstrap, menu, window),
   `view.rs` (terminal view, rendering, IME), `font.rs` (font loading).
 - `src/terminal/mod.rs`: terminal module exports.
@@ -74,10 +79,14 @@ flowchart LR
 - `src/terminal/color.rs`: ANSI/xterm color mapping.
 - `src/terminal/keymap.rs`: key event translation (AppKit).
 - `src/terminal/pty.rs`: PTY session lifecycle, resize handling, and IO threads.
+- `src/terminal/resize.rs`: resize debounce coalescing (grid + PTY resized together).
+- `src/terminal/selection.rs`: line-based text selection and extraction.
 
 ## Notes
 
-- The AppKit path uses an NSTimer to drive render updates at 120Hz.
+- Rendering is event-driven: PTY output is coalesced on the main run loop
+  (8ms debounce) and redraws go through `setNeedsDisplay`/`drawRect`.
+- Window resizes are debounced for 150ms, then applied to the grid and PTY together.
 - Resizes propagate through TIOCSWINSZ and SIGWINCH to keep shells happy.
 
 ## Build Requirements
