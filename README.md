@@ -73,7 +73,14 @@ flowchart LR
 - `src/lib.rs`: library root exposing the `mac_app` module.
 - `src/main.rs`: binary entry point calling `shitty::mac_app::run()`.
 - `src/mac_app/`: native AppKit UI — `app.rs` (bootstrap, menu, window),
-  `view.rs` (terminal view, rendering, IME), `font.rs` (font loading).
+  `view/` (terminal view, split by component), `font.rs` (font loading).
+- `src/mac_app/view/`: `mod.rs` (module wiring), `terminal_view.rs` (NSView
+  subclass, events, IME), `state.rs` (view-wide state), `tabs.rs` (tab list and
+  tab commands), `tab_bar.rs` (tab strip drawing and hit testing),
+  `scrollbar.rs` (scrollbar and scrolling), `renderer.rs` (cells, cursor,
+  selection, marked text), `resize.rs` (debounced resize reflow),
+  `geometry.rs` (bounds ↔ grid math), `ime.rs` (composition state), `wake.rs`
+  (PTY event bridge).
 - `src/terminal/mod.rs`: terminal module exports.
 - `src/terminal/grid.rs`: alacritty_terminal parser wrapper and grid access.
 - `src/terminal/color.rs`: ANSI/xterm color mapping.

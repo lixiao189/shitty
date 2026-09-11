@@ -6,7 +6,10 @@ This is **Shitty**, a small terminal emulator written in Rust (2024 edition). Th
 
 - `src/lib.rs` — library root exposing the `mac_app` module.
 - `src/main.rs` — thin binary entry point that calls `shitty::mac_app::run()`.
-- `src/mac_app/` — native macOS AppKit window, view, and renderer.
+- `src/mac_app/` — native macOS AppKit window, view, and renderer. The view is
+  split by component under `src/mac_app/view/`: `terminal_view.rs` (NSView sub-
+  class, events, IME), `state.rs`, `tabs.rs`, `tab_bar.rs`, `scrollbar.rs`,
+  `renderer.rs`, `resize.rs`, `geometry.rs`, `ime.rs`, `wake.rs`.
 - `src/terminal/` — terminal core: `grid.rs` (alacritty_terminal parser wrapper), `color.rs` (ANSI/xterm/RGB color mapping), `keymap.rs` (key translation), `pty.rs` (PTY lifecycle and resize), `resize.rs` (resize debouncing), `selection.rs` (text selection).
 - `assets/` — bundled Nerd Font variants and images (e.g., `arch.png`, `icon.png`).
 - `target_local/` — build output; the custom target dir is set in `.cargo/config.toml`.
