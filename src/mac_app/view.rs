@@ -1,9 +1,9 @@
 use crate::terminal::color::{Color32, SELECTION_BG};
-use crate::terminal::grid::{CellPos, TerminalGrid};
+use crate::terminal::grid::CellPos;
 use crate::terminal::keymap;
-use crate::terminal::pty::PtyEvent;
 use crate::terminal::resize::{RESIZE_DEBOUNCE_DELAY, ResizeDebouncer};
 use crate::terminal::selection::Selection;
+use crate::terminal::session::TerminalSession;
 use alacritty_terminal::vte::ansi::CursorShape;
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{AnyObject, Bool, ProtocolObject, Sel};
@@ -19,8 +19,8 @@ use objc2_foundation::{
     NSArray, NSAttributedString, NSAttributedStringKey, NSDictionary, NSMutableDictionary,
     NSNotFound, NSObject, NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize, NSString, NSUInteger,
 };
+use std::error::Error;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use super::cast_any_object;
@@ -33,11 +33,31 @@ const OUTPUT_DEBOUNCE_DELAY: Duration = Duration::from_millis(8);
 /// Cap on PTY bytes parsed per event so a huge burst never freezes the main thread.
 const MAX_PTY_BYTES_PER_DRAIN: usize = 256 * 1024;
 
+/// Height of the tab strip drawn above the terminal content.
+const TAB_BAR_HEIGHT: f64 = 30.0;
+/// Width of one tab in the tab strip.
+const TAB_WIDTH: f64 = 170.0;
+/// Click zone at the right edge of a tab that closes it.
+const TAB_CLOSE_ZONE: f64 = 22.0;
+/// Horizontal padding between a tab's edge and its label.
+const TAB_TEXT_PADDING: f64 = 8.0;
+/// Width of the "+" button drawn after the last tab.
+const NEW_TAB_WIDTH: f64 = 30.0;
+/// Point size of tab-strip labels.
+const TAB_FONT_SIZE: f64 = 12.0;
+
+const TAB_BAR_BG: Color32 = Color32::from_rgb(36, 36, 42);
+const TAB_ACTIVE_BG: Color32 = Color32::from_rgb(18, 18, 22);
+const TAB_SEPARATOR: Color32 = Color32::from_rgb(58, 58, 66);
+const TAB_ACTIVE_ACCENT: Color32 = Color32::from_rgb(90, 140, 240);
+const TAB_ACTIVE_FG: Color32 = Color32::from_rgb(225, 225, 230);
+const TAB_INACTIVE_FG: Color32 = Color32::from_rgb(150, 150, 158);
+const TAB_CLOSE_FG: Color32 = Color32::from_rgb(140, 140, 148);
+
 /// Objective-C target used to bridge background PTY events onto the main run loop.
 /// It uses only Foundation selectors, avoiding a separate dispatch dependency.
 pub(super) struct ViewWakeIvars {
     output_pending: AtomicBool,
-    exit_pending: AtomicBool,
     view: AtomicPtr<ShittyTerminalView>,
 }
 
@@ -77,7 +97,7 @@ define_class!(
         fn session_exited(&self, _sender: Option<&AnyObject>) {
             let view = self.ivars().view.load(Ordering::Acquire);
             if let Some(view) = unsafe { Retained::retain(view) } {
-                view.close_window();
+                view.session_exited();
             }
         }
 
@@ -95,7 +115,6 @@ impl ViewWake {
     fn new() -> Retained<Self> {
         let this = Self::alloc().set_ivars(ViewWakeIvars {
             output_pending: AtomicBool::new(false),
-            exit_pending: AtomicBool::new(false),
             view: AtomicPtr::new(std::ptr::null_mut()),
         });
         unsafe { msg_send![super(this), init] }
@@ -125,17 +144,16 @@ impl ViewWake {
         }
     }
 
-    /// Deliver shell exit immediately and at most once on the main thread.
+    /// Deliver a shell exit on the main thread. Every session dispatches its
+    /// own callback so one exiting tab can never mask another.
     pub(super) fn signal_exit(&self) {
-        if !self.ivars().exit_pending.swap(true, Ordering::AcqRel) {
-            unsafe {
-                let _: () = msg_send![
-                    self,
-                    performSelectorOnMainThread: sel!(sessionExited:),
-                    withObject: None::<&AnyObject>,
-                    waitUntilDone: false
-                ];
-            }
+        unsafe {
+            let _: () = msg_send![
+                self,
+                performSelectorOnMainThread: sel!(sessionExited:),
+                withObject: None::<&AnyObject>,
+                waitUntilDone: false
+            ];
         }
     }
 
@@ -161,11 +179,12 @@ const SCROLLBAR_INSET: f64 = 2.0;
 /// Lines scrolled per notch of a non-precise (mouse wheel) event.
 const WHEEL_NOTCH_LINES: f64 = 3.0;
 
-/// Rust-side state owned by the terminal view.
+/// Rust-side state owned by the terminal view. It owns every tab and the
+/// view-level state (font metrics, IME, resize debouncing) shared by them.
 pub(super) struct TerminalViewState {
-    grid: TerminalGrid,
-    rx_output: Receiver<Vec<u8>>,
-    tx_input: Sender<PtyEvent>,
+    sessions: Vec<TerminalSession>,
+    active: usize,
+    next_session_id: u64,
     font: Retained<NSFont>,
     font_size: f64,
     cell_width: f64,
@@ -174,37 +193,24 @@ pub(super) struct TerminalViewState {
     ime_composing: bool,
     had_composition: bool,
     skip_next_command: bool,
-    selection: Option<Selection>,
     resize_debouncer: ResizeDebouncer,
     /// Whether one delayed resize callback is already queued.
     resize_task_scheduled: bool,
-    /// Fractional scroll-wheel delta waiting to be applied to the grid.
-    scroll_accum: f64,
-    /// Whether the scrollbar thumb is being dragged.
-    scrollbar_dragging: bool,
-    /// Shared with the PTY reader thread, which signals it when shell output arrives.
+    /// Shared with the PTY reader threads, which signal it when output arrives.
     wake: Retained<ViewWake>,
 }
 
 impl TerminalViewState {
     pub(super) fn new(
-        rx_output: Receiver<Vec<u8>>,
-        tx_input: Sender<PtyEvent>,
         font: Retained<NSFont>,
         cell_width: f64,
         cell_height: f64,
-    ) -> Self {
+    ) -> Result<Self, Box<dyn Error>> {
         let font_size = font.pointSize();
-        Self {
-            grid: TerminalGrid::new_with_pty_size(
-                80,
-                24,
-                tx_input.clone(),
-                cell_width,
-                cell_height,
-            ),
-            rx_output,
-            tx_input,
+        let mut state = Self {
+            sessions: Vec::new(),
+            active: 0,
+            next_session_id: 1,
             font,
             font_size,
             cell_width,
@@ -213,27 +219,102 @@ impl TerminalViewState {
             ime_composing: false,
             had_composition: false,
             skip_next_command: false,
-            selection: None,
             resize_debouncer: ResizeDebouncer::new(),
             resize_task_scheduled: false,
-            scroll_accum: 0.0,
-            scrollbar_dragging: false,
             wake: ViewWake::new(),
+        };
+        // The first size is applied by the view once it knows its bounds.
+        state.spawn_session(80, 24)?;
+        Ok(state)
+    }
+
+    /// The focused session. The view always owns at least one: closing the
+    /// last tab closes the window instead of emptying the list.
+    fn active(&self) -> &TerminalSession {
+        &self.sessions[self.active]
+    }
+
+    fn active_mut(&mut self) -> &mut TerminalSession {
+        &mut self.sessions[self.active]
+    }
+
+    /// The tab strip is only worth showing once there is more than one tab;
+    /// a lone tab gets the whole view.
+    fn show_tab_bar(&self) -> bool {
+        self.sessions.len() > 1
+    }
+
+    /// Open a new shell session and focus it.
+    fn spawn_session(&mut self, cols: usize, rows: usize) -> Result<(), Box<dyn Error>> {
+        let id = self.next_session_id;
+        self.next_session_id += 1;
+        let wake_output = self.wake.clone();
+        let wake_exit = self.wake.clone();
+        let session = TerminalSession::spawn(
+            id,
+            cols,
+            rows,
+            self.cell_width,
+            self.cell_height,
+            move || wake_output.signal_output(),
+            move || wake_exit.signal_exit(),
+        )?;
+        self.sessions.push(session);
+        self.active = self.sessions.len() - 1;
+        Ok(())
+    }
+
+    /// Close the tab at `index`. Returns false when it is the last tab, in
+    /// which case the caller closes the window instead.
+    fn close_tab(&mut self, index: usize) -> bool {
+        if self.sessions.len() <= 1 || index >= self.sessions.len() {
+            return false;
         }
+        let previous_active_id = self.sessions.get(self.active).map(TerminalSession::id);
+        self.sessions.remove(index);
+        self.active = previous_active_id
+            .and_then(|id| self.sessions.iter().position(|session| session.id() == id))
+            .unwrap_or_else(|| index.min(self.sessions.len() - 1));
+        true
+    }
+
+    /// Drop sessions whose shells have exited. Returns true when no live
+    /// session remains, in which case the caller closes the window.
+    fn remove_exited_sessions(&mut self) -> bool {
+        if self.sessions.iter().all(TerminalSession::exited) {
+            return true;
+        }
+        let previous_active_id = self.sessions.get(self.active).map(TerminalSession::id);
+        self.sessions.retain(|session| !session.exited());
+        self.active = previous_active_id
+            .and_then(|id| self.sessions.iter().position(|session| session.id() == id))
+            .unwrap_or_else(|| self.sessions.len() - 1);
+        false
+    }
+
+    /// Focus the tab at `index`; returns whether the focus moved.
+    fn select_tab(&mut self, index: usize) -> bool {
+        if index >= self.sessions.len() || index == self.active {
+            return false;
+        }
+        self.active = index;
+        // Composition belongs to the focused session, so it never carries over.
+        self.marked_text.clear();
+        self.ime_composing = false;
+        self.had_composition = false;
+        self.skip_next_command = false;
+        true
     }
 
     fn send_input(&mut self, bytes: Vec<u8>) {
-        if !bytes.is_empty() {
-            // Any keyboard input snaps the view back to the live screen.
-            self.grid.scroll_to(0);
-            let _ = self.tx_input.send(PtyEvent::Input(bytes));
-        }
+        self.active_mut().send_input(bytes);
     }
 
     /// Scroll the view by whole lines; positive moves toward older history.
     fn scroll_by_lines(&mut self, lines: isize) {
-        if self.grid.scroll_by(lines) {
-            self.selection = None;
+        let session = self.active_mut();
+        if session.grid.scroll_by(lines) {
+            session.selection = None;
         }
     }
 
@@ -245,7 +326,8 @@ impl TerminalViewState {
         };
         let track_h = track.size.height.max(0.0);
         let travel = (track_h - thumb.size.height).max(0.0);
-        let max_scroll = self.grid.max_scroll();
+        let session = self.active_mut();
+        let max_scroll = session.grid.max_scroll();
         let y = y - track.origin.y;
         let thumb_y = (y - thumb.size.height / 2.0).clamp(0.0, travel);
         let offset = if travel > 0.0 {
@@ -253,40 +335,14 @@ impl TerminalViewState {
         } else {
             0
         };
-        if self.grid.scroll_to(offset) {
-            self.selection = None;
+        if session.grid.scroll_to(offset) {
+            session.selection = None;
         }
     }
 
     /// The thumb rect for the given track, or None when there is no history.
     fn scrollbar_thumb(&self, track: NSRect) -> Option<NSRect> {
-        let max_scroll = self.grid.max_scroll();
-        if max_scroll == 0 {
-            return None;
-        }
-        let rows = self.grid.rows();
-        let content = max_scroll + rows;
-        let track_h = track.size.height.max(0.0);
-        let thumb_h = (rows as f64 / content as f64 * track_h)
-            .max(SCROLLBAR_MIN_THUMB)
-            .min(track_h);
-        let travel = (track_h - thumb_h).max(0.0);
-        // offset 0 (newest) puts the thumb at the bottom of the track.
-        let thumb_y = self.grid.scroll_offset() as f64 / max_scroll as f64 * travel;
-        let thumb_w = (track.size.width - 2.0 * SCROLLBAR_INSET).max(0.0);
-        Some(NSRect::new(
-            NSPoint::new(track.origin.x + SCROLLBAR_INSET, track.origin.y + thumb_y),
-            NSSize::new(thumb_w, thumb_h),
-        ))
-    }
-
-    fn send_resize(&mut self, cols: usize, rows: usize) {
-        if self.resize_debouncer.mark_sent((cols, rows)) {
-            let _ = self.tx_input.send(PtyEvent::Resize {
-                cols: cols as u16,
-                rows: rows as u16,
-            });
-        }
+        scrollbar_thumb_for(self.active(), track)
     }
 
     /// Clipboard shortcuts (⌘C copy / ⌘V paste, ESC cancels selection).
@@ -304,7 +360,7 @@ impl TerminalViewState {
             .contains(NSEventModifierFlags::Command);
 
         if has_command && characters.eq_ignore_ascii_case("c") {
-            if self.selection.is_some() {
+            if self.active().selection.is_some() {
                 self.copy_selection();
             } else {
                 self.send_input(vec![0x03]);
@@ -317,8 +373,8 @@ impl TerminalViewState {
             return true;
         }
 
-        if characters == "\u{1b}" && self.selection.is_some() {
-            self.selection = None;
+        if characters == "\u{1b}" && self.active().selection.is_some() {
+            self.active_mut().selection = None;
             return true;
         }
 
@@ -364,16 +420,18 @@ impl TerminalViewState {
         self.font_size = size;
         self.cell_width = cell_width;
         self.cell_height = cell_height;
-        self.grid.set_cell_size(cell_width, cell_height);
-        // The selection is stored in cell coordinates, so it no longer fits.
-        self.selection = None;
+        for session in &mut self.sessions {
+            session.grid.set_cell_size(cell_width, cell_height);
+            // The selection is stored in cell coordinates, so it no longer fits.
+            session.selection = None;
+        }
     }
 
     fn copy_selection(&self) {
-        let Some(selection) = &self.selection else {
+        let Some(selection) = &self.active().selection else {
             return;
         };
-        let text = selection.selected_text(&self.grid);
+        let text = selection.selected_text(&self.active().grid);
         if text.is_empty() {
             return;
         }
@@ -404,26 +462,22 @@ impl TerminalViewState {
     fn cursor_cell_rect(&self, bounds: NSRect) -> NSRect {
         let origin = bounds.origin;
         let (cell_w, cell_h) = (self.cell_width, self.cell_height);
-        let (cursor_row, cursor_col) = self.grid.cursor_pos();
+        let (cursor_row, cursor_col) = self.active().grid.cursor_pos();
         let x0 = origin.x + cursor_col as f64 * cell_w;
         let y0 = origin.y + bounds.size.height - ((cursor_row + 1) as f64 * cell_h);
         NSRect::new(NSPoint::new(x0, y0), NSSize::new(cell_w, cell_h))
     }
 
-    /// Drain pending PTY output into the grid, bounded so a huge redraw burst
-    /// never stalls the main thread for long.
+    /// Drain pending PTY output for every session, bounded so a huge redraw
+    /// burst never stalls the main thread for long.
     fn drain_pty_output(&mut self) -> bool {
-        let mut processed_bytes = 0usize;
-        while processed_bytes < MAX_PTY_BYTES_PER_DRAIN {
-            match self.rx_output.try_recv() {
-                Ok(bytes) => {
-                    processed_bytes += bytes.len();
-                    self.grid.process_pty_bytes(&bytes);
-                }
-                Err(_) => return false,
-            }
+        let session_count = self.sessions.len().max(1);
+        let mut budget = (MAX_PTY_BYTES_PER_DRAIN / session_count).max(4096);
+        let mut needs_follow_up = false;
+        for session in &mut self.sessions {
+            needs_follow_up |= session.drain_output(&mut budget);
         }
-        true
+        needs_follow_up
     }
 
     fn marked_text_range(&self) -> NSRange {
@@ -474,15 +528,39 @@ define_class!(
             };
             let location = self.convertPoint_fromView(event.locationInWindow(), None);
             let bounds = self.bounds();
-            if state.grid.max_scroll() > 0
+
+            if let Some(hit) = tab_bar_hit(location, bounds, state.sessions.len()) {
+                if let Some(window) = self.window() {
+                    window.makeFirstResponder(Some(self));
+                }
+                match hit {
+                    TabBarHit::Tab(index) => {
+                        if state.select_tab(index) {
+                            self.setNeedsDisplay(true);
+                        }
+                    }
+                    TabBarHit::Close(index) => {
+                        if state.close_tab(index) {
+                            self.resize_grid_now(state);
+                        } else {
+                            self.close_window();
+                        }
+                    }
+                    TabBarHit::NewTab => self.create_tab(state),
+                }
+                return;
+            }
+
+            if state.active().grid.max_scroll() > 0
                 && location.x >= bounds.origin.x + bounds.size.width - SCROLLBAR_WIDTH
             {
-                state.scrollbar_dragging = true;
-                state.scroll_to_track_y(location.y, scrollbar_track(bounds));
+                state.active_mut().scrollbar_dragging = true;
+                let track = scrollbar_track(terminal_bounds(bounds, state.show_tab_bar()));
+                state.scroll_to_track_y(location.y, track);
                 self.setNeedsDisplay(true);
                 return;
             }
-            state.selection = Some(Selection::start(self.cell_at_event(event)));
+            state.active_mut().selection = Some(Selection::start(self.cell_at_event(event)));
             if let Some(window) = self.window() {
                 window.makeFirstResponder(Some(self));
             }
@@ -495,13 +573,15 @@ define_class!(
             let Some(state) = (unsafe { state_ptr.as_mut() }) else {
                 return;
             };
-            if state.scrollbar_dragging {
+            if state.active().scrollbar_dragging {
                 let location = self.convertPoint_fromView(event.locationInWindow(), None);
-                state.scroll_to_track_y(location.y, scrollbar_track(self.bounds()));
+                let track =
+                    scrollbar_track(terminal_bounds(self.bounds(), state.show_tab_bar()));
+                state.scroll_to_track_y(location.y, track);
                 self.setNeedsDisplay(true);
                 return;
             }
-            if let Some(selection) = state.selection.as_mut() {
+            if let Some(selection) = state.active_mut().selection.as_mut() {
                 selection.set_head(self.cell_at_event(event));
                 self.setNeedsDisplay(true);
             }
@@ -513,9 +593,9 @@ define_class!(
             let Some(state) = (unsafe { state_ptr.as_mut() }) else {
                 return;
             };
-            state.scrollbar_dragging = false;
-            if state.selection.as_ref().is_some_and(|s| s.is_empty()) {
-                state.selection = None;
+            state.active_mut().scrollbar_dragging = false;
+            if state.active().selection.as_ref().is_some_and(|s| s.is_empty()) {
+                state.active_mut().selection = None;
                 self.setNeedsDisplay(true);
             }
         }
@@ -531,15 +611,40 @@ define_class!(
             if !event.hasPreciseScrollingDeltas() {
                 delta *= WHEEL_NOTCH_LINES;
             }
-            state.scroll_accum += delta;
-            let lines = state.scroll_accum.trunc() as isize;
+            let session = state.active_mut();
+            session.scroll_accum += delta;
+            let lines = session.scroll_accum.trunc() as isize;
             if lines != 0 {
-                state.scroll_accum -= lines as f64;
-                if state.grid.scroll_by(lines) {
-                    state.selection = None;
+                session.scroll_accum -= lines as f64;
+                if session.grid.scroll_by(lines) {
+                    session.selection = None;
                     self.setNeedsDisplay(true);
                 }
             }
+        }
+
+        #[unsafe(method(newTab:))]
+        fn new_tab(&self, _sender: Option<&AnyObject>) {
+            let state_ptr = self.ivars().state;
+            let Some(state) = (unsafe { state_ptr.as_mut() }) else {
+                return;
+            };
+            self.create_tab(state);
+        }
+
+        #[unsafe(method(closeTab:))]
+        fn close_tab(&self, _sender: Option<&AnyObject>) {
+            self.close_active_tab();
+        }
+
+        #[unsafe(method(selectNextTab:))]
+        fn select_next_tab(&self, _sender: Option<&AnyObject>) {
+            self.select_relative_tab(1);
+        }
+
+        #[unsafe(method(selectPreviousTab:))]
+        fn select_previous_tab(&self, _sender: Option<&AnyObject>) {
+            self.select_relative_tab(-1);
         }
 
         #[unsafe(method(keyDown:))]
@@ -548,6 +653,20 @@ define_class!(
             if let Some(state) = unsafe { state_ptr.as_mut() } {
                 if state.handle_clipboard_key(event) {
                     self.setNeedsDisplay(true);
+                    return;
+                }
+                // ⌘⇧[ / ⌘⇧] are normally consumed by the menu key
+                // equivalents; this covers layouts where they are not.
+                if !state.ime_composing && handle_tab_switch_key(event) {
+                    let delta = if event
+                        .charactersIgnoringModifiers()
+                        .is_some_and(|characters| characters.to_string() == "{")
+                    {
+                        -1
+                    } else {
+                        1
+                    };
+                    self.select_relative_tab(delta);
                     return;
                 }
                 // Font zoom shortcuts (⌘+/⌘−/⌘0) are handled here rather
@@ -589,33 +708,43 @@ define_class!(
             let state = unsafe { &*state_ptr };
 
             let bounds = self.bounds();
-            let origin = bounds.origin;
+            let show_tab_bar = state.show_tab_bar();
+            let terminal = terminal_bounds(bounds, show_tab_bar);
+            let origin = terminal.origin;
             let scale = self
                 .window()
                 .map(|window| window.backingScaleFactor())
                 .unwrap_or(1.0);
-            let default_bg = state.grid.default_bg();
+            let session = state.active();
+            let default_bg = session.grid.default_bg();
 
             to_nscolor(default_bg).set();
-            NSBezierPath::fillRect(bounds);
+            NSBezierPath::fillRect(terminal);
 
-            if let Some(selection) = &state.selection {
-                paint_selection_overlay(state, selection, bounds, scale);
+            if let Some(selection) = &session.selection {
+                paint_selection_overlay(
+                    session,
+                    selection,
+                    terminal,
+                    scale,
+                    state.cell_width,
+                    state.cell_height,
+                );
             }
 
-            for row in 0..state.grid.rows() {
-                for run in state.grid.row_runs(row) {
+            for row in 0..session.grid.rows() {
+                for run in session.grid.row_runs(row) {
                     let x0 = snap_to_pixel(origin.x + run.col as f64 * state.cell_width, scale);
                     let x1 = snap_to_pixel(
                         origin.x + (run.col + run.width) as f64 * state.cell_width,
                         scale,
                     );
                     let y0 = snap_to_pixel(
-                        origin.y + bounds.size.height - ((row + 1) as f64 * state.cell_height),
+                        origin.y + terminal.size.height - ((row + 1) as f64 * state.cell_height),
                         scale,
                     );
                     let y1 = snap_to_pixel(
-                        origin.y + bounds.size.height - (row as f64 * state.cell_height),
+                        origin.y + terminal.size.height - (row as f64 * state.cell_height),
                         scale,
                     );
                     let rect_w = (x1 - x0).max(0.0);
@@ -648,18 +777,18 @@ define_class!(
                 }
             }
 
-            if let Some(cursor) = state.grid.cursor() {
+            if let Some(cursor) = session.grid.cursor() {
                 let cursor_x0 = snap_to_pixel(origin.x + cursor.col as f64 * state.cell_width, scale);
                 let cursor_x1 = snap_to_pixel(
                     origin.x + (cursor.col + 1) as f64 * state.cell_width,
                     scale,
                 );
                 let cursor_y0 = snap_to_pixel(
-                    origin.y + bounds.size.height - ((cursor.row + 1) as f64 * state.cell_height),
+                    origin.y + terminal.size.height - ((cursor.row + 1) as f64 * state.cell_height),
                     scale,
                 );
                 let cursor_y1 = snap_to_pixel(
-                    origin.y + bounds.size.height - (cursor.row as f64 * state.cell_height),
+                    origin.y + terminal.size.height - (cursor.row as f64 * state.cell_height),
                     scale,
                 );
                 let cell_w = (cursor_x1 - cursor_x0).max(0.0);
@@ -723,14 +852,14 @@ define_class!(
             }
 
             if !state.marked_text.is_empty() {
-                let (cursor_row, cursor_col) = state.grid.cursor_pos();
+                let (cursor_row, cursor_col) = session.grid.cursor_pos();
                 let marked_x0 = snap_to_pixel(origin.x + cursor_col as f64 * state.cell_width, scale);
                 let marked_y0 = snap_to_pixel(
-                    origin.y + bounds.size.height - ((cursor_row + 1) as f64 * state.cell_height),
+                    origin.y + terminal.size.height - ((cursor_row + 1) as f64 * state.cell_height),
                     scale,
                 );
                 let marked_y1 = snap_to_pixel(
-                    origin.y + bounds.size.height - (cursor_row as f64 * state.cell_height),
+                    origin.y + terminal.size.height - (cursor_row as f64 * state.cell_height),
                     scale,
                 );
                 let marked_rect_h = (marked_y1 - marked_y0).max(0.0);
@@ -755,8 +884,12 @@ define_class!(
                 NSBezierPath::fillRect(underline_rect);
             }
 
-            if state.grid.max_scroll() > 0 {
-                paint_scrollbar(state, bounds, scale);
+            if session.grid.max_scroll() > 0 {
+                paint_scrollbar(session, terminal, scale);
+            }
+
+            if show_tab_bar {
+                paint_tab_bar(state, bounds);
             }
         }
     }
@@ -804,12 +937,14 @@ define_class!(
             if let Ok(name) = selector.name().to_str() {
                 match name {
                     "scrollPageUp:" => {
-                        state.scroll_by_lines(state.grid.rows() as isize);
+                        let rows = state.active().grid.rows() as isize;
+                        state.scroll_by_lines(rows);
                         self.setNeedsDisplay(true);
                         return;
                     }
                     "scrollPageDown:" => {
-                        state.scroll_by_lines(-(state.grid.rows() as isize));
+                        let rows = state.active().grid.rows() as isize;
+                        state.scroll_by_lines(-rows);
                         self.setNeedsDisplay(true);
                         return;
                     }
@@ -949,6 +1084,10 @@ impl ShittyTerminalView {
         // Register the view with the wake handle so the PTY reader thread can
         // trigger coalesced drain+redraw passes from now on.
         view.ivars().wake.attach(Retained::as_ptr(&view).cast_mut());
+        // The shell may have printed its prompt before the view existed; its
+        // bytes are still queued, so drain them once now.
+        view.pty_output_ready();
+        view.setNeedsDisplay(true);
         view
     }
 
@@ -959,8 +1098,8 @@ impl ShittyTerminalView {
             return;
         }
         let state = unsafe { &mut *state_ptr };
-        let cols = ((size.width / state.cell_width).floor() as usize).max(1);
-        let rows = ((size.height / state.cell_height).floor() as usize).max(1);
+        let show_tab_bar = state.show_tab_bar();
+        let (cols, rows) = grid_size_for(size, state.cell_width, state.cell_height, show_tab_bar);
         if !state.resize_debouncer.record(cols, rows, Instant::now()) {
             return;
         }
@@ -1009,20 +1148,36 @@ impl ShittyTerminalView {
         }
     }
 
+    /// Apply one size to every tab so switching tabs never shows a stale
+    /// width; the PTY is told once per size.
     fn apply_grid_size(state: &mut TerminalViewState, cols: usize, rows: usize) {
-        if state.grid.resize(cols, rows) {
-            state.send_resize(cols, rows);
-            state.selection = None;
-        } else {
-            // Grid already has this size; make sure the PTY knows too.
-            state.send_resize(cols, rows);
+        let notify_pty = state.resize_debouncer.mark_sent((cols, rows));
+        for session in &mut state.sessions {
+            if session.grid.resize(cols, rows) {
+                session.selection = None;
+            }
+            if notify_pty {
+                session.send_resize(cols, rows);
+            }
         }
     }
 
+    /// Redraw when the active grid changed; background tabs are parsed but
+    /// only need a repaint when their titles change.
     fn redraw_grid_if_changed(&self, state: &mut TerminalViewState) {
-        if state.grid.has_changes() {
+        let active = state.active;
+        let mut tab_bar_dirty = false;
+        for (index, session) in state.sessions.iter_mut().enumerate() {
+            tab_bar_dirty |= session.sync_title();
+            if session.grid.has_changes() {
+                session.grid.mark_rendered();
+                if index == active {
+                    self.setNeedsDisplay(true);
+                }
+            }
+        }
+        if tab_bar_dirty {
             self.setNeedsDisplay(true);
-            state.grid.mark_rendered();
         }
     }
 
@@ -1046,9 +1201,90 @@ impl ShittyTerminalView {
         needs_follow_up
     }
 
-    /// The event bridge shared with the PTY reader thread.
-    pub(super) fn view_wake_handle(&self) -> Retained<ViewWake> {
-        self.ivars().wake.clone()
+    /// Open a tab sized to the current view. The new tab always makes the
+    /// strip visible, so the session starts at the shrunken size.
+    fn create_tab(&self, state: &mut TerminalViewState) {
+        let (cols, rows) = grid_size_for(
+            self.bounds().size,
+            state.cell_width,
+            state.cell_height,
+            true,
+        );
+        match state.spawn_session(cols, rows) {
+            Ok(()) => {
+                state
+                    .sessions
+                    .last()
+                    .expect("spawn_session pushes the new tab")
+                    .send_resize(cols, rows);
+                // A second tab reveals the strip, which shrinks the terminal.
+                self.resize_grid_now(state);
+            }
+            Err(error) => eprintln!("failed to create tab: {error}"),
+        }
+    }
+
+    /// Re-derive the grid size from the current bounds and apply it without
+    /// waiting for the resize debounce. Used when the tab strip appears or
+    /// disappears, which immediately changes the terminal area.
+    fn resize_grid_now(&self, state: &mut TerminalViewState) {
+        let show_tab_bar = state.show_tab_bar();
+        let (cols, rows) = grid_size_for(
+            self.bounds().size,
+            state.cell_width,
+            state.cell_height,
+            show_tab_bar,
+        );
+        if state.resize_debouncer.record(cols, rows, Instant::now())
+            && let Some((cols, rows)) = state.resize_debouncer.take_now()
+        {
+            Self::apply_grid_size(state, cols, rows);
+        }
+        self.setNeedsDisplay(true);
+    }
+
+    /// Close the focused tab, or the window when it is the last one.
+    fn close_active_tab(&self) {
+        let state_ptr = self.ivars().state;
+        let Some(state) = (unsafe { state_ptr.as_mut() }) else {
+            return;
+        };
+        let index = state.active;
+        if state.close_tab(index) {
+            self.resize_grid_now(state);
+        } else {
+            self.close_window();
+        }
+    }
+
+    /// Focus the tab `delta` positions away, wrapping around.
+    fn select_relative_tab(&self, delta: isize) {
+        let state_ptr = self.ivars().state;
+        let Some(state) = (unsafe { state_ptr.as_mut() }) else {
+            return;
+        };
+        let count = state.sessions.len();
+        if count < 2 {
+            return;
+        }
+        let next = (state.active as isize + delta).rem_euclid(count as isize) as usize;
+        if state.select_tab(next) {
+            self.setNeedsDisplay(true);
+        }
+    }
+
+    /// Called when a shell exits: drop its tab, or close the window when no
+    /// session is left.
+    fn session_exited(&self) {
+        let state_ptr = self.ivars().state;
+        let Some(state) = (unsafe { state_ptr.as_mut() }) else {
+            return;
+        };
+        if state.remove_exited_sessions() {
+            self.close_window();
+        } else {
+            self.resize_grid_now(state);
+        }
     }
 
     /// Convert a mouse event into a snapped grid cell.
@@ -1060,12 +1296,13 @@ impl ShittyTerminalView {
         let bounds = self.bounds();
         let location = self.convertPoint_fromView(event.locationInWindow(), None);
         let x = (location.x - bounds.origin.x).max(0.0);
-        let y = (bounds.size.height - (location.y - bounds.origin.y)).max(0.0);
+        let terminal_height = terminal_bounds(bounds, state.show_tab_bar()).size.height;
+        let y = (terminal_height - (location.y - bounds.origin.y)).max(0.0);
         let pos = CellPos::new(
             (y / state.cell_height) as usize,
             (x / state.cell_width) as usize,
         );
-        state.grid.snap_cell_pos(pos)
+        state.active().grid.snap_cell_pos(pos)
     }
 }
 
@@ -1108,10 +1345,12 @@ fn text_attributes(
 }
 
 fn paint_selection_overlay(
-    state: &TerminalViewState,
+    session: &TerminalSession,
     selection: &Selection,
     bounds: NSRect,
     scale: f64,
+    cell_width: f64,
+    cell_height: f64,
 ) {
     let color = NSColor::colorWithSRGBRed_green_blue_alpha(
         SELECTION_BG.r as f64 / 255.0,
@@ -1120,23 +1359,22 @@ fn paint_selection_overlay(
         SELECTION_BG.a as f64 / 255.0,
     );
     color.set();
-    for row in 0..state.grid.rows() {
+    for row in 0..session.grid.rows() {
         let mut col = 0;
-        while col < state.grid.cols() {
+        while col < session.grid.cols() {
             if selection.contains(row, col) {
                 let start_col = col;
-                while col < state.grid.cols() && selection.contains(row, col) {
+                while col < session.grid.cols() && selection.contains(row, col) {
                     col += 1;
                 }
-                let x0 =
-                    snap_to_pixel(bounds.origin.x + start_col as f64 * state.cell_width, scale);
-                let x1 = snap_to_pixel(bounds.origin.x + col as f64 * state.cell_width, scale);
+                let x0 = snap_to_pixel(bounds.origin.x + start_col as f64 * cell_width, scale);
+                let x1 = snap_to_pixel(bounds.origin.x + col as f64 * cell_width, scale);
                 let y0 = snap_to_pixel(
-                    bounds.origin.y + bounds.size.height - ((row + 1) as f64 * state.cell_height),
+                    bounds.origin.y + bounds.size.height - ((row + 1) as f64 * cell_height),
                     scale,
                 );
                 let y1 = snap_to_pixel(
-                    bounds.origin.y + bounds.size.height - (row as f64 * state.cell_height),
+                    bounds.origin.y + bounds.size.height - (row as f64 * cell_height),
                     scale,
                 );
                 let rect = NSRect::new(
@@ -1162,9 +1400,32 @@ fn scrollbar_track(bounds: NSRect) -> NSRect {
     )
 }
 
-fn paint_scrollbar(state: &TerminalViewState, bounds: NSRect, scale: f64) {
+/// The thumb rect for a session's scrollbar track, or None without history.
+fn scrollbar_thumb_for(session: &TerminalSession, track: NSRect) -> Option<NSRect> {
+    let grid = &session.grid;
+    let max_scroll = grid.max_scroll();
+    if max_scroll == 0 {
+        return None;
+    }
+    let rows = grid.rows();
+    let content = max_scroll + rows;
+    let track_h = track.size.height.max(0.0);
+    let thumb_h = (rows as f64 / content as f64 * track_h)
+        .max(SCROLLBAR_MIN_THUMB)
+        .min(track_h);
+    let travel = (track_h - thumb_h).max(0.0);
+    // offset 0 (newest) puts the thumb at the bottom of the track.
+    let thumb_y = grid.scroll_offset() as f64 / max_scroll as f64 * travel;
+    let thumb_w = (track.size.width - 2.0 * SCROLLBAR_INSET).max(0.0);
+    Some(NSRect::new(
+        NSPoint::new(track.origin.x + SCROLLBAR_INSET, track.origin.y + thumb_y),
+        NSSize::new(thumb_w, thumb_h),
+    ))
+}
+
+fn paint_scrollbar(session: &TerminalSession, bounds: NSRect, scale: f64) {
     let track = scrollbar_track(bounds);
-    let Some(thumb) = state.scrollbar_thumb(track) else {
+    let Some(thumb) = scrollbar_thumb_for(session, track) else {
         return;
     };
 
@@ -1186,6 +1447,214 @@ fn paint_scrollbar(state: &TerminalViewState, bounds: NSRect, scale: f64) {
     let thumb_color = NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.28);
     thumb_color.set();
     path.fill();
+}
+
+/// Terminal content rect: the view minus the tab strip, when shown.
+fn terminal_bounds(bounds: NSRect, show_tab_bar: bool) -> NSRect {
+    let bar_height = if show_tab_bar { TAB_BAR_HEIGHT } else { 0.0 };
+    NSRect::new(
+        bounds.origin,
+        NSSize::new(
+            bounds.size.width,
+            (bounds.size.height - bar_height).max(0.0),
+        ),
+    )
+}
+
+/// The grid dimensions that fit a view of `size`.
+fn grid_size_for(
+    size: NSSize,
+    cell_width: f64,
+    cell_height: f64,
+    show_tab_bar: bool,
+) -> (usize, usize) {
+    let cols = ((size.width / cell_width).floor() as usize).max(1);
+    let bar_height = if show_tab_bar { TAB_BAR_HEIGHT } else { 0.0 };
+    let terminal_height = (size.height - bar_height).max(cell_height);
+    let rows = ((terminal_height / cell_height).floor() as usize).max(1);
+    (cols, rows)
+}
+
+/// The strip at the top of the view that holds the tabs.
+fn tab_bar_rect(bounds: NSRect) -> NSRect {
+    NSRect::new(
+        NSPoint::new(
+            bounds.origin.x,
+            bounds.origin.y + bounds.size.height - TAB_BAR_HEIGHT,
+        ),
+        NSSize::new(bounds.size.width, TAB_BAR_HEIGHT),
+    )
+}
+
+fn tab_rect(index: usize, bounds: NSRect) -> NSRect {
+    let bar = tab_bar_rect(bounds);
+    NSRect::new(
+        NSPoint::new(bar.origin.x + index as f64 * TAB_WIDTH, bar.origin.y),
+        NSSize::new(TAB_WIDTH, bar.size.height),
+    )
+}
+
+fn new_tab_rect(tab_count: usize, bounds: NSRect) -> NSRect {
+    let bar = tab_bar_rect(bounds);
+    NSRect::new(
+        NSPoint::new(bar.origin.x + tab_count as f64 * TAB_WIDTH, bar.origin.y),
+        NSSize::new(NEW_TAB_WIDTH, bar.size.height),
+    )
+}
+
+/// Where a click inside the tab strip landed.
+#[derive(Debug, PartialEq, Eq)]
+enum TabBarHit {
+    Tab(usize),
+    Close(usize),
+    NewTab,
+}
+
+/// Map a point (view coordinates) to a tab-strip control, if any.
+/// A hidden strip (a single tab) never consumes clicks.
+fn tab_bar_hit(location: NSPoint, bounds: NSRect, tab_count: usize) -> Option<TabBarHit> {
+    if tab_count <= 1 {
+        return None;
+    }
+    let bar = tab_bar_rect(bounds);
+    if location.y < bar.origin.y || location.y > bar.origin.y + bar.size.height {
+        return None;
+    }
+    let x = location.x - bar.origin.x;
+    if x < 0.0 || x > bar.size.width {
+        return None;
+    }
+    let index = (x / TAB_WIDTH).floor() as usize;
+    if index < tab_count {
+        if x >= (index as f64 + 1.0) * TAB_WIDTH - TAB_CLOSE_ZONE {
+            return Some(TabBarHit::Close(index));
+        }
+        return Some(TabBarHit::Tab(index));
+    }
+    if x < tab_count as f64 * TAB_WIDTH + NEW_TAB_WIDTH {
+        return Some(TabBarHit::NewTab);
+    }
+    None
+}
+
+/// Fallback handling for ⌘⇧[ / ⌘⇧] when the menu key equivalents do not
+/// consume them (e.g. on some keyboard layouts).
+fn handle_tab_switch_key(event: &NSEvent) -> bool {
+    let flags = event.modifierFlags();
+    if !flags.contains(NSEventModifierFlags::Command)
+        || !flags.contains(NSEventModifierFlags::Shift)
+    {
+        return false;
+    }
+    matches!(
+        event
+            .charactersIgnoringModifiers()
+            .map(|characters| characters.to_string())
+            .as_deref(),
+        Some("{") | Some("}")
+    )
+}
+
+fn paint_tab_bar(state: &TerminalViewState, bounds: NSRect) {
+    let bar = tab_bar_rect(bounds);
+    if bar.size.height <= 0.0 {
+        return;
+    }
+    to_nscolor(TAB_BAR_BG).set();
+    NSBezierPath::fillRect(bar);
+
+    let font = NSFont::systemFontOfSize(TAB_FONT_SIZE);
+    let font_height = font.ascender() - font.descender();
+
+    for (index, session) in state.sessions.iter().enumerate() {
+        let rect = tab_rect(index, bounds);
+        if rect.origin.x >= bounds.origin.x + bounds.size.width {
+            break;
+        }
+        let is_active = index == state.active;
+        to_nscolor(if is_active { TAB_ACTIVE_BG } else { TAB_BAR_BG }).set();
+        NSBezierPath::fillRect(rect);
+
+        if is_active {
+            to_nscolor(TAB_ACTIVE_ACCENT).set();
+            NSBezierPath::fillRect(NSRect::new(
+                NSPoint::new(rect.origin.x, rect.origin.y + rect.size.height - 2.0),
+                NSSize::new(rect.size.width, 2.0),
+            ));
+        }
+
+        to_nscolor(TAB_SEPARATOR).set();
+        NSBezierPath::fillRect(NSRect::new(
+            NSPoint::new(rect.origin.x + rect.size.width - 1.0, rect.origin.y),
+            NSSize::new(1.0, rect.size.height),
+        ));
+
+        let text_color = if is_active {
+            TAB_ACTIVE_FG
+        } else {
+            TAB_INACTIVE_FG
+        };
+        let attrs = text_attributes(&font, &to_nscolor(text_color));
+        let max_text_width = (rect.size.width - TAB_CLOSE_ZONE - 2.0 * TAB_TEXT_PADDING).max(0.0);
+        let title = truncate_title(session.display_title(), &attrs, max_text_width);
+        let title_pos = NSPoint::new(
+            rect.origin.x + TAB_TEXT_PADDING,
+            rect.origin.y + (rect.size.height - font_height) / 2.0,
+        );
+        let ns_title = NSString::from_str(&title);
+        unsafe { ns_title.drawAtPoint_withAttributes(title_pos, Some(&attrs)) };
+
+        let close_attrs = text_attributes(&font, &to_nscolor(TAB_CLOSE_FG));
+        let close = NSString::from_str("×");
+        let close_size = unsafe { close.sizeWithAttributes(Some(&close_attrs)) };
+        let close_pos = NSPoint::new(
+            rect.origin.x + rect.size.width - TAB_CLOSE_ZONE
+                + (TAB_CLOSE_ZONE - close_size.width) / 2.0,
+            rect.origin.y + (rect.size.height - font_height) / 2.0,
+        );
+        unsafe { close.drawAtPoint_withAttributes(close_pos, Some(&close_attrs)) };
+    }
+
+    let plus_rect = new_tab_rect(state.sessions.len(), bounds);
+    if plus_rect.origin.x < bounds.origin.x + bounds.size.width {
+        let attrs = text_attributes(&font, &to_nscolor(TAB_INACTIVE_FG));
+        let plus = NSString::from_str("+");
+        let plus_size = unsafe { plus.sizeWithAttributes(Some(&attrs)) };
+        let plus_pos = NSPoint::new(
+            plus_rect.origin.x + (plus_rect.size.width - plus_size.width) / 2.0,
+            plus_rect.origin.y + (plus_rect.size.height - font_height) / 2.0,
+        );
+        unsafe { plus.drawAtPoint_withAttributes(plus_pos, Some(&attrs)) };
+    }
+
+    // Separates the tab strip from the terminal below it.
+    to_nscolor(TAB_SEPARATOR).set();
+    NSBezierPath::fillRect(NSRect::new(
+        NSPoint::new(bar.origin.x, bar.origin.y),
+        NSSize::new(bar.size.width, 1.0),
+    ));
+}
+
+/// Shorten a tab title with an ellipsis so it fits `max_width`.
+fn truncate_title(
+    text: &str,
+    attrs: &NSMutableDictionary<NSAttributedStringKey, AnyObject>,
+    max_width: f64,
+) -> String {
+    let ns_text = NSString::from_str(text);
+    if max_width <= 0.0 || unsafe { ns_text.sizeWithAttributes(Some(attrs)) }.width <= max_width {
+        return text.to_owned();
+    }
+    let mut characters: Vec<char> = text.chars().collect();
+    while !characters.is_empty() {
+        characters.pop();
+        let candidate: String = characters.iter().collect::<String>() + "…";
+        let ns_candidate = NSString::from_str(&candidate);
+        if unsafe { ns_candidate.sizeWithAttributes(Some(attrs)) }.width <= max_width {
+            return candidate;
+        }
+    }
+    "…".to_owned()
 }
 
 fn ns_object_to_string(obj: &AnyObject) -> Option<String> {
@@ -1215,4 +1684,90 @@ fn snap_to_pixel(value: f64, scale: f64) -> f64 {
         return value;
     }
     (value * scale).round() / scale
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bounds() -> NSRect {
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 600.0))
+    }
+
+    #[test]
+    fn hidden_tab_bar_gives_the_whole_view_to_the_terminal() {
+        let size = NSSize::new(800.0, 600.0);
+        assert_eq!(grid_size_for(size, 10.0, 20.0, false), (80, 30));
+        assert_eq!(terminal_bounds(bounds(), false), bounds());
+    }
+
+    #[test]
+    fn grid_size_uses_the_area_below_the_tab_bar() {
+        assert_eq!(
+            grid_size_for(NSSize::new(800.0, 600.0), 10.0, 20.0, true),
+            (80, 28)
+        );
+    }
+
+    #[test]
+    fn terminal_bounds_leaves_room_for_the_tab_bar() {
+        let terminal = terminal_bounds(bounds(), true);
+        assert_eq!(terminal.origin.y, 0.0);
+        assert_eq!(terminal.size.height, 600.0 - TAB_BAR_HEIGHT);
+    }
+
+    #[test]
+    fn view_state_opens_and_closes_tabs() {
+        let font = load_terminal_font(DEFAULT_FONT_SIZE);
+        let (cell_width, cell_height) = measure_cell_size(&font);
+        let mut state =
+            TerminalViewState::new(font, cell_width, cell_height).expect("first tab spawns");
+
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.active, 0);
+        assert!(!state.show_tab_bar());
+
+        state.spawn_session(80, 24).expect("second tab spawns");
+        assert_eq!(state.sessions.len(), 2);
+        assert_eq!(state.active, 1);
+        assert!(state.show_tab_bar());
+
+        assert!(state.select_tab(0));
+        assert_eq!(state.active, 0);
+
+        assert!(state.close_tab(0));
+        assert_eq!(state.sessions.len(), 1);
+        assert_eq!(state.active, 0);
+        assert!(!state.show_tab_bar());
+
+        // The last tab stays in the list; the caller closes the window instead.
+        assert!(!state.close_tab(0));
+        assert_eq!(state.sessions.len(), 1);
+    }
+
+    #[test]
+    fn tab_bar_hit_maps_clicks_to_tabs_and_controls() {
+        let bounds = bounds();
+        let y = bounds.size.height - TAB_BAR_HEIGHT / 2.0;
+
+        assert_eq!(
+            tab_bar_hit(NSPoint::new(10.0, y), bounds, 2),
+            Some(TabBarHit::Tab(0))
+        );
+        assert_eq!(
+            tab_bar_hit(NSPoint::new(TAB_WIDTH + 10.0, y), bounds, 2),
+            Some(TabBarHit::Tab(1))
+        );
+        assert_eq!(
+            tab_bar_hit(NSPoint::new(TAB_WIDTH - 5.0, y), bounds, 2),
+            Some(TabBarHit::Close(0))
+        );
+        assert_eq!(
+            tab_bar_hit(NSPoint::new(2.0 * TAB_WIDTH + 5.0, y), bounds, 2),
+            Some(TabBarHit::NewTab)
+        );
+        assert_eq!(tab_bar_hit(NSPoint::new(10.0, 10.0), bounds, 2), None);
+        // A lone tab hides the strip, so its former area is terminal content.
+        assert_eq!(tab_bar_hit(NSPoint::new(10.0, y), bounds, 1), None);
+    }
 }

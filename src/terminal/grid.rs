@@ -68,6 +68,8 @@ pub(crate) struct TerminalGrid {
     cell_height: f64,
     event_tx: Option<Sender<PtyEvent>>,
     pending_events: Rc<RefCell<Vec<Event>>>,
+    /// Window title last set by the shell via OSC 0/2, used for tab labels.
+    title: Option<String>,
 }
 
 impl TerminalGrid {
@@ -91,6 +93,7 @@ impl TerminalGrid {
             cell_height: 1.0,
             event_tx: None,
             pending_events,
+            title: None,
         }
     }
 
@@ -129,6 +132,11 @@ impl TerminalGrid {
         self.default_bg
     }
 
+    /// The title set by the shell (OSC 0/2), if any.
+    pub(crate) fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
     pub(crate) fn cursor_visible(&self) -> bool {
         self.term.mode().contains(TermMode::SHOW_CURSOR)
     }
@@ -157,10 +165,12 @@ impl TerminalGrid {
     }
 
     /// Drain pending terminal events and write query responses (DSR, color, size) to the PTY.
-    fn handle_terminal_events(&self) {
+    fn handle_terminal_events(&mut self) {
         let events = std::mem::take(&mut *self.pending_events.borrow_mut());
         for event in events {
             match event {
+                Event::Title(title) => self.title = (!title.is_empty()).then_some(title),
+                Event::ResetTitle => self.title = None,
                 Event::PtyWrite(text) => self.write_to_pty(text.into_bytes()),
                 Event::ColorRequest(index, formatter) => {
                     if let Some(color) = self.color_for_index(index) {
@@ -742,5 +752,20 @@ mod tests {
         }
 
         assert!(rx.try_recv().is_err(), "expected no extra PTY writes");
+    }
+
+    #[test]
+    fn osc_title_events_set_and_reset_the_grid_title() {
+        let mut grid = TerminalGrid::new(10, 2);
+        assert_eq!(grid.title(), None);
+
+        grid.process_pty_bytes(b"\x1b]0;my shell\x07");
+        assert_eq!(grid.title(), Some("my shell"));
+
+        grid.process_pty_bytes(b"\x1b]2;other\x1b\\");
+        assert_eq!(grid.title(), Some("other"));
+
+        grid.process_pty_bytes(b"\x1b]0;\x07");
+        assert_eq!(grid.title(), None);
     }
 }

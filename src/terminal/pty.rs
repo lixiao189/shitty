@@ -1,5 +1,5 @@
 use nix::libc::{
-    SIGWINCH, TIOCSCTTY, TIOCSWINSZ, ioctl, killpg, pid_t, setsid, tcgetpgrp, winsize,
+    SIGHUP, SIGWINCH, TIOCSCTTY, TIOCSWINSZ, ioctl, killpg, pid_t, setsid, tcgetpgrp, winsize,
 };
 use nix::pty::openpty;
 use nix::unistd::{read, write};
@@ -36,8 +36,11 @@ impl Pty {
     /// Pump data between the PTY and the UI:
     /// - a reader thread forwards shell output to `tx_output`, invoking `on_output` after each chunk;
     /// - a writer thread applies `PtyEvent`s received on `rx_input` to the master fd.
+    ///
+    /// Takes `&self` so the owning session keeps the PTY alive and can
+    /// terminate it when its tab closes.
     pub(crate) fn spawn_threads(
-        self,
+        &self,
         tx_output: Sender<Vec<u8>>,
         rx_input: Receiver<PtyEvent>,
         on_output: impl Fn() + Send + 'static,
@@ -108,6 +111,26 @@ impl Pty {
                 }
             }
         });
+    }
+
+    /// Hang up the shell and its foreground job so the reader thread sees EOF
+    /// and no orphaned processes keep the slave side open.
+    pub(crate) fn terminate(&self) {
+        let fd = self.master.as_raw_fd();
+        let foreground_pgid = unsafe { tcgetpgrp(fd) };
+        for pgid in [self.shell_pgid, foreground_pgid] {
+            if pgid > 0 {
+                unsafe {
+                    let _ = killpg(pgid, SIGHUP);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Pty {
+    fn drop(&mut self) {
+        self.terminate();
     }
 }
 

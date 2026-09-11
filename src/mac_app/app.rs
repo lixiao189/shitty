@@ -1,6 +1,5 @@
-use crate::terminal::pty::{Pty, PtyEvent};
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
+use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject, Sel};
 use objc2::{
     AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
 };
@@ -11,16 +10,12 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString, ns_string};
 use std::cell::RefCell;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::error::Error;
 
 use super::font::{DEFAULT_FONT_SIZE, load_terminal_font, measure_cell_size};
 use super::view::{ShittyTerminalView, TerminalViewState};
 
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let pty = Pty::spawn()?;
-    let (tx_pty_output, rx_pty_output) = channel::<Vec<u8>>();
-    let (tx_pty_input, rx_pty_input) = channel::<PtyEvent>();
-
+pub fn run() -> Result<(), Box<dyn Error>> {
     let mtm = MainThreadMarker::new().ok_or("must be on main thread")?;
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
@@ -31,26 +26,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let delegate = ShittyAppDelegate::new(mtm, rx_pty_output, tx_pty_input);
+    let delegate = ShittyAppDelegate::new(mtm)?;
     app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-
-    // PTY output and exit events wake the view on the main thread. Output
-    // bursts are coalesced before the grid is drained and redrawn.
-    let wake = delegate
-        .ivars()
-        .terminal_view
-        .borrow()
-        .as_ref()
-        .cloned()
-        .expect("terminal view initialized before launch")
-        .view_wake_handle();
-    let exit_wake = wake.clone();
-    pty.spawn_threads(
-        tx_pty_output,
-        rx_pty_input,
-        move || wake.signal_output(),
-        move || exit_wake.signal_exit(),
-    );
 
     app.run();
     Ok(())
@@ -84,10 +61,44 @@ fn macos_quit_menu_item_spec() -> ShortcutMenuItemSpec {
     }
 }
 
+fn macos_new_tab_menu_item_spec() -> ShortcutMenuItemSpec {
+    ShortcutMenuItemSpec {
+        title: "New Tab",
+        key_equivalent: "t",
+        modifier_mask: objc2_app_kit::NSEventModifierFlags::Command,
+    }
+}
+
+fn macos_close_tab_menu_item_spec() -> ShortcutMenuItemSpec {
+    ShortcutMenuItemSpec {
+        title: "Close Tab",
+        key_equivalent: "w",
+        modifier_mask: objc2_app_kit::NSEventModifierFlags::Command,
+    }
+}
+
 fn macos_close_window_menu_item_spec() -> ShortcutMenuItemSpec {
+    // An uppercase key equivalent implies Shift, i.e. ⌘⇧W.
     ShortcutMenuItemSpec {
         title: "Close Window",
-        key_equivalent: "w",
+        key_equivalent: "W",
+        modifier_mask: objc2_app_kit::NSEventModifierFlags::Command,
+    }
+}
+
+fn macos_next_tab_menu_item_spec() -> ShortcutMenuItemSpec {
+    // Shift is carried by the shifted character itself, i.e. ⌘⇧].
+    ShortcutMenuItemSpec {
+        title: "Show Next Tab",
+        key_equivalent: "}",
+        modifier_mask: objc2_app_kit::NSEventModifierFlags::Command,
+    }
+}
+
+fn macos_previous_tab_menu_item_spec() -> ShortcutMenuItemSpec {
+    ShortcutMenuItemSpec {
+        title: "Show Previous Tab",
+        key_equivalent: "{",
         modifier_mask: objc2_app_kit::NSEventModifierFlags::Command,
     }
 }
@@ -154,24 +165,17 @@ define_class!(
 );
 
 impl ShittyAppDelegate {
-    fn new(
-        mtm: MainThreadMarker,
-        rx_output: Receiver<Vec<u8>>,
-        tx_input: Sender<PtyEvent>,
-    ) -> Retained<Self> {
-        let view_state = terminal_view_state(rx_output, tx_input);
+    fn new(mtm: MainThreadMarker) -> Result<Retained<Self>, Box<dyn Error>> {
+        let view_state = terminal_view_state()?;
         let this = Self::alloc(mtm).set_ivars(AppDelegateIvars::new(mtm, view_state));
-        unsafe { msg_send![super(this), init] }
+        Ok(unsafe { msg_send![super(this), init] })
     }
 }
 
-fn terminal_view_state(
-    rx_output: Receiver<Vec<u8>>,
-    tx_input: Sender<PtyEvent>,
-) -> TerminalViewState {
+fn terminal_view_state() -> Result<TerminalViewState, Box<dyn Error>> {
     let font = load_terminal_font(DEFAULT_FONT_SIZE);
     let (cell_width, cell_height) = measure_cell_size(&font);
-    TerminalViewState::new(rx_output, tx_input, font, cell_width, cell_height)
+    TerminalViewState::new(font, cell_width, cell_height)
 }
 
 struct AppDelegateIvars {
@@ -206,20 +210,12 @@ fn setup_main_menu(mtm: MainThreadMarker) {
 
     let app_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!(""));
     app_menu_item.setSubmenu(Some(&app_menu));
-
-    let quit_spec = macos_quit_menu_item_spec();
-    let quit_title = NSString::from_str(quit_spec.title);
-    let quit_key = NSString::from_str(quit_spec.key_equivalent);
-    let quit_item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &quit_title,
-            Some(sel!(terminate:)),
-            &quit_key,
-        )
-    };
-    quit_item.setKeyEquivalentModifierMask(quit_spec.modifier_mask);
-    app_menu.addItem(&quit_item);
+    add_shortcut_item(
+        mtm,
+        &app_menu,
+        macos_quit_menu_item_spec(),
+        sel!(terminate:),
+    );
 
     let file_menu_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -234,19 +230,58 @@ fn setup_main_menu(mtm: MainThreadMarker) {
     let file_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("File"));
     file_menu_item.setSubmenu(Some(&file_menu));
 
-    let close_spec = macos_close_window_menu_item_spec();
-    let close_title = NSString::from_str(close_spec.title);
-    let close_key = NSString::from_str(close_spec.key_equivalent);
-    let close_item = unsafe {
+    add_shortcut_item(
+        mtm,
+        &file_menu,
+        macos_new_tab_menu_item_spec(),
+        sel!(newTab:),
+    );
+    add_shortcut_item(
+        mtm,
+        &file_menu,
+        macos_close_tab_menu_item_spec(),
+        sel!(closeTab:),
+    );
+    file_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    add_shortcut_item(
+        mtm,
+        &file_menu,
+        macos_close_window_menu_item_spec(),
+        sel!(performClose:),
+    );
+    file_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    add_shortcut_item(
+        mtm,
+        &file_menu,
+        macos_previous_tab_menu_item_spec(),
+        sel!(selectPreviousTab:),
+    );
+    add_shortcut_item(
+        mtm,
+        &file_menu,
+        macos_next_tab_menu_item_spec(),
+        sel!(selectNextTab:),
+    );
+}
+
+fn add_shortcut_item(
+    mtm: MainThreadMarker,
+    menu: &NSMenu,
+    spec: ShortcutMenuItemSpec,
+    action: Sel,
+) {
+    let title = NSString::from_str(spec.title);
+    let key = NSString::from_str(spec.key_equivalent);
+    let item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
-            &close_title,
-            Some(sel!(performClose:)),
-            &close_key,
+            &title,
+            Some(action),
+            &key,
         )
     };
-    close_item.setKeyEquivalentModifierMask(close_spec.modifier_mask);
-    file_menu.addItem(&close_item);
+    item.setKeyEquivalentModifierMask(spec.modifier_mask);
+    menu.addItem(&item);
 }
 
 #[cfg(test)]
@@ -265,13 +300,54 @@ mod tests {
     }
 
     #[test]
-    fn macos_command_w_close_window_spec_is_standard() {
-        let spec = macos_close_window_menu_item_spec();
-        assert_eq!(spec.title, "Close Window");
+    fn macos_command_t_new_tab_spec_is_standard() {
+        let spec = macos_new_tab_menu_item_spec();
+        assert_eq!(spec.title, "New Tab");
+        assert_eq!(spec.key_equivalent, "t");
+        assert!(
+            spec.modifier_mask
+                .contains(objc2_app_kit::NSEventModifierFlags::Command)
+        );
+    }
+
+    #[test]
+    fn macos_command_w_closes_a_tab() {
+        let spec = macos_close_tab_menu_item_spec();
+        assert_eq!(spec.title, "Close Tab");
         assert_eq!(spec.key_equivalent, "w");
         assert!(
             spec.modifier_mask
                 .contains(objc2_app_kit::NSEventModifierFlags::Command)
         );
+    }
+
+    #[test]
+    fn macos_command_shift_w_close_window_spec_is_standard() {
+        let spec = macos_close_window_menu_item_spec();
+        assert_eq!(spec.title, "Close Window");
+        assert_eq!(spec.key_equivalent, "W");
+        assert!(
+            spec.modifier_mask
+                .contains(objc2_app_kit::NSEventModifierFlags::Command)
+        );
+    }
+
+    #[test]
+    fn macos_command_shift_bracket_switches_tabs() {
+        let next = macos_next_tab_menu_item_spec();
+        assert_eq!(next.key_equivalent, "}");
+        let previous = macos_previous_tab_menu_item_spec();
+        assert_eq!(previous.key_equivalent, "{");
+        for spec in [next, previous] {
+            assert!(
+                spec.modifier_mask
+                    .contains(objc2_app_kit::NSEventModifierFlags::Command)
+            );
+            assert!(
+                !spec
+                    .modifier_mask
+                    .contains(objc2_app_kit::NSEventModifierFlags::Shift)
+            );
+        }
     }
 }
