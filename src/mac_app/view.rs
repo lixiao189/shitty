@@ -45,6 +45,16 @@ const TAB_TEXT_PADDING: f64 = 8.0;
 const NEW_TAB_WIDTH: f64 = 30.0;
 /// Point size of tab-strip labels.
 const TAB_FONT_SIZE: f64 = 12.0;
+/// Number of tabs reachable through ⌘1–⌘9; the hint is drawn for each.
+const TAB_SHORTCUT_COUNT: usize = 9;
+/// Height of the ⌘N keycap hint drawn on tabs with a shortcut.
+const TAB_SHORTCUT_HEIGHT: f64 = 16.0;
+/// Horizontal padding inside the ⌘N keycap.
+const TAB_SHORTCUT_PADDING: f64 = 5.0;
+/// Gap between the ⌘N keycap and the close button.
+const TAB_SHORTCUT_MARGIN: f64 = 4.0;
+/// Corner radius of the ⌘N keycap.
+const TAB_SHORTCUT_RADIUS: f64 = 3.0;
 
 const TAB_BAR_BG: Color32 = Color32::from_rgb(36, 36, 42);
 const TAB_ACTIVE_BG: Color32 = Color32::from_rgb(18, 18, 22);
@@ -53,6 +63,8 @@ const TAB_ACTIVE_ACCENT: Color32 = Color32::from_rgb(90, 140, 240);
 const TAB_ACTIVE_FG: Color32 = Color32::from_rgb(225, 225, 230);
 const TAB_INACTIVE_FG: Color32 = Color32::from_rgb(150, 150, 158);
 const TAB_CLOSE_FG: Color32 = Color32::from_rgb(140, 140, 148);
+const TAB_SHORTCUT_FG: Color32 = Color32::from_rgb(132, 132, 141);
+const TAB_SHORTCUT_BG: Color32 = Color32::from_rgba(255, 255, 255, 18);
 
 /// Objective-C target used to bridge background PTY events onto the main run loop.
 /// It uses only Foundation selectors, avoiding a separate dispatch dependency.
@@ -653,6 +665,12 @@ define_class!(
             if let Some(state) = unsafe { state_ptr.as_mut() } {
                 if state.handle_clipboard_key(event) {
                     self.setNeedsDisplay(true);
+                    return;
+                }
+                // ⌘1–⌘9 focus the tab at that position; tabs past the ninth
+                // stay reachable through the tab strip.
+                if !state.ime_composing && let Some(index) = handle_tab_index_key(event) {
+                    self.select_tab_at(index);
                     return;
                 }
                 // ⌘⇧[ / ⌘⇧] are normally consumed by the menu key
@@ -1273,6 +1291,18 @@ impl ShittyTerminalView {
         }
     }
 
+    /// Focus the tab at `index`; out-of-range indices are ignored so only
+    /// the first nine tabs have a ⌘1–⌘9 shortcut.
+    fn select_tab_at(&self, index: usize) {
+        let state_ptr = self.ivars().state;
+        let Some(state) = (unsafe { state_ptr.as_mut() }) else {
+            return;
+        };
+        if state.select_tab(index) {
+            self.setNeedsDisplay(true);
+        }
+    }
+
     /// Called when a shell exits: drop its tab, or close the window when no
     /// session is left.
     fn session_exited(&self) {
@@ -1555,6 +1585,31 @@ fn handle_tab_switch_key(event: &NSEvent) -> bool {
     )
 }
 
+/// Maps a ⌘1–⌘9 key press to a zero-based tab index; None for any other
+/// combination, including ⌘0 and digits past nine.
+fn handle_tab_index_key(event: &NSEvent) -> Option<usize> {
+    let characters = event
+        .charactersIgnoringModifiers()
+        .map(|characters| characters.to_string())
+        .unwrap_or_default();
+    tab_index_shortcut(&characters, event.modifierFlags())
+}
+
+fn tab_index_shortcut(characters: &str, modifiers: NSEventModifierFlags) -> Option<usize> {
+    if !modifiers.contains(NSEventModifierFlags::Command) {
+        return None;
+    }
+    let mut chars = characters.chars();
+    let digit = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    match digit {
+        '1'..='9' => Some(digit as usize - '1' as usize),
+        _ => None,
+    }
+}
+
 fn paint_tab_bar(state: &TerminalViewState, bounds: NSRect) {
     let bar = tab_bar_rect(bounds);
     if bar.size.height <= 0.0 {
@@ -1595,7 +1650,9 @@ fn paint_tab_bar(state: &TerminalViewState, bounds: NSRect) {
             TAB_INACTIVE_FG
         };
         let attrs = text_attributes(&font, &to_nscolor(text_color));
-        let max_text_width = (rect.size.width - TAB_CLOSE_ZONE - 2.0 * TAB_TEXT_PADDING).max(0.0);
+        let shortcut_space = paint_tab_shortcut(index, rect, &font, font_height);
+        let max_text_width =
+            (rect.size.width - TAB_CLOSE_ZONE - 2.0 * TAB_TEXT_PADDING - shortcut_space).max(0.0);
         let title = truncate_title(session.display_title(), &attrs, max_text_width);
         let title_pos = NSPoint::new(
             rect.origin.x + TAB_TEXT_PADDING,
@@ -1633,6 +1690,44 @@ fn paint_tab_bar(state: &TerminalViewState, bounds: NSRect) {
         NSPoint::new(bar.origin.x, bar.origin.y),
         NSSize::new(bar.size.width, 1.0),
     ));
+}
+
+/// Draw the ⌘N keycap hint at the trailing edge of a tab, just left of its
+/// close button, and return the horizontal space it reserved. Tabs past the
+/// ninth have no shortcut, so they reserve nothing.
+fn paint_tab_shortcut(index: usize, rect: NSRect, font: &NSFont, font_height: f64) -> f64 {
+    let Some(label) = tab_shortcut_label(index) else {
+        return 0.0;
+    };
+    let attrs = text_attributes(font, &to_nscolor(TAB_SHORTCUT_FG));
+    let label = NSString::from_str(&label);
+    let size = unsafe { label.sizeWithAttributes(Some(&attrs)) };
+    let width = size.width + 2.0 * TAB_SHORTCUT_PADDING;
+    let badge = NSRect::new(
+        NSPoint::new(
+            rect.origin.x + rect.size.width - TAB_CLOSE_ZONE - TAB_SHORTCUT_MARGIN - width,
+            rect.origin.y + (rect.size.height - TAB_SHORTCUT_HEIGHT) / 2.0,
+        ),
+        NSSize::new(width, TAB_SHORTCUT_HEIGHT),
+    );
+    to_nscolor(TAB_SHORTCUT_BG).set();
+    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+        badge,
+        TAB_SHORTCUT_RADIUS,
+        TAB_SHORTCUT_RADIUS,
+    )
+    .fill();
+    let text_pos = NSPoint::new(
+        badge.origin.x + (badge.size.width - size.width) / 2.0,
+        badge.origin.y + (badge.size.height - font_height) / 2.0,
+    );
+    unsafe { label.drawAtPoint_withAttributes(text_pos, Some(&attrs)) };
+    width + TAB_SHORTCUT_MARGIN
+}
+
+/// Label of the ⌘N hint for a tab index, or None past the ninth tab.
+fn tab_shortcut_label(index: usize) -> Option<String> {
+    (index < TAB_SHORTCUT_COUNT).then(|| format!("⌘{}", index + 1))
 }
 
 /// Shorten a tab title with an ellipsis so it fits `max_width`.
@@ -1769,5 +1864,26 @@ mod tests {
         assert_eq!(tab_bar_hit(NSPoint::new(10.0, 10.0), bounds, 2), None);
         // A lone tab hides the strip, so its former area is terminal content.
         assert_eq!(tab_bar_hit(NSPoint::new(10.0, y), bounds, 1), None);
+    }
+
+    #[test]
+    fn command_digits_map_to_tab_indices() {
+        let command = NSEventModifierFlags::Command;
+        assert_eq!(tab_index_shortcut("1", command), Some(0));
+        assert_eq!(tab_index_shortcut("5", command), Some(4));
+        assert_eq!(tab_index_shortcut("9", command), Some(8));
+
+        assert_eq!(tab_index_shortcut("0", command), None);
+        assert_eq!(tab_index_shortcut("1", NSEventModifierFlags::empty()), None);
+        assert_eq!(tab_index_shortcut("!", command), None);
+        assert_eq!(tab_index_shortcut("12", command), None);
+        assert_eq!(tab_index_shortcut("", command), None);
+    }
+
+    #[test]
+    fn only_the_first_nine_tabs_have_shortcut_hints() {
+        assert_eq!(tab_shortcut_label(0).as_deref(), Some("⌘1"));
+        assert_eq!(tab_shortcut_label(8).as_deref(), Some("⌘9"));
+        assert_eq!(tab_shortcut_label(9), None);
     }
 }
