@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 nix = { version = "0.31.1", features = ["term"] }
 alacritty_terminal = "0.26.0"
+unicode-width = "0.2.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.3"
@@ -13,3 +14,4 @@ objc2-app-kit = "0.3.2"
 objc2-foundation = "0.3.2"
 objc2-core-foundation = "0.3.2"
 objc2-core-text = "0.3.2"
+objc2-core-graphics = "0.3.2"
