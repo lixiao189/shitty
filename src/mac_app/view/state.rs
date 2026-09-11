@@ -14,8 +14,10 @@ use crate::terminal::session::TerminalSession;
 use objc2::rc::{Retained, autoreleasepool};
 use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSFont, NSPasteboard, NSPasteboardTypeString};
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use std::cell::RefCell;
 use std::error::Error;
 
+use super::glyphs::GlyphCache;
 use super::wake::ViewWake;
 
 /// Cap on PTY bytes parsed per event so a huge burst never freezes the main thread.
@@ -37,6 +39,10 @@ pub(in crate::mac_app) struct TerminalViewState {
     pub(super) resize_debouncer: ResizeDebouncer,
     /// Whether one delayed resize callback is already queued.
     pub(super) resize_task_scheduled: bool,
+    /// Shaped glyphs for the current font, plus the faces Core Text fell back
+    /// to for it. Interior mutability because painting only ever gets a shared
+    /// reference to the state.
+    pub(super) glyphs: RefCell<GlyphCache>,
     /// Shared with the PTY reader threads, which signal it when output arrives.
     pub(super) wake: Retained<ViewWake>,
 }
@@ -48,6 +54,7 @@ impl TerminalViewState {
         cell_height: f64,
     ) -> Result<Self, Box<dyn Error>> {
         let font_size = font.pointSize();
+        let glyphs = RefCell::new(GlyphCache::new(&font));
         let mut state = Self {
             sessions: Vec::new(),
             active: 0,
@@ -62,6 +69,7 @@ impl TerminalViewState {
             skip_next_command: false,
             resize_debouncer: ResizeDebouncer::new(),
             resize_task_scheduled: false,
+            glyphs,
             wake: ViewWake::new(),
         };
         // The first size is applied by the view once it knows its bounds.
@@ -158,6 +166,8 @@ impl TerminalViewState {
         self.font_size = size;
         self.cell_width = cell_width;
         self.cell_height = cell_height;
+        // The glyphs belong to the old face.
+        *self.glyphs.borrow_mut() = GlyphCache::new(&self.font);
         for session in &mut self.sessions {
             session.grid.set_cell_size(cell_width, cell_height);
             // The selection is stored in cell coordinates, so it no longer fits.
@@ -203,9 +213,14 @@ impl TerminalViewState {
         let origin = bounds.origin;
         let (cell_w, cell_h) = (self.cell_width, self.cell_height);
         let (cursor_row, cursor_col) = self.active().grid.cursor_pos();
+        // A wide character fills two columns, and its block cursor covers both.
+        let cells = match self.active().grid.cursor() {
+            Some(cursor) if cursor.wide => 2.0,
+            _ => 1.0,
+        };
         let x0 = origin.x + cursor_col as f64 * cell_w;
         let y0 = origin.y + bounds.size.height - ((cursor_row + 1) as f64 * cell_h);
-        NSRect::new(NSPoint::new(x0, y0), NSSize::new(cell_w, cell_h))
+        NSRect::new(NSPoint::new(x0, y0), NSSize::new(cell_w * cells, cell_h))
     }
 
     /// Drain pending PTY output for every session, bounded so a huge redraw

@@ -7,12 +7,14 @@
 //! - [`tab_bar`] draws the tab strip and maps clicks inside it.
 //! - [`scrollbar`] draws the scrollbar and applies scroll gestures.
 //! - [`renderer`] paints cells, cursor, selection, and IME text.
+//! - [`glyphs`] resolves characters to glyphs for the cell-anchored renderer.
 //! - [`resize`] turns frame changes into debounced grid and PTY resizes.
 //! - [`geometry`] converts between view bounds and grid sizes.
 //! - [`ime`] tracks the input-method composition state.
 //! - [`wake`] bridges background PTY events onto the main run loop.
 
 mod geometry;
+mod glyphs;
 mod ime;
 mod renderer;
 mod resize;
