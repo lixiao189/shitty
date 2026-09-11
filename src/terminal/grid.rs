@@ -9,9 +9,16 @@ use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor, R
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
+use unicode_width::UnicodeWidthChar;
 
 /// Maximum number of scrollback rows kept above the visible screen.
 pub(crate) const SCROLLBACK_LEN: usize = 1000;
+
+/// Columns `ch` occupies in the grid: two for wide (CJK) characters, none for
+/// combining marks and other zero-width characters.
+pub(crate) fn display_cells(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(0)
+}
 
 /// A position in the terminal grid; row 0 is the top line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -333,6 +340,11 @@ impl TerminalGrid {
     /// Adjacent cells with identical style are merged, and the right halves of
     /// wide characters are folded into their wide run, so renderers can paint
     /// each run with a single draw call.
+    ///
+    /// A wide character always ends up in a run of its own (see
+    /// [`CellRun::wide`]): renderers draw a run as one string starting at
+    /// `col`, which is only correct while the advances the font reports match
+    /// the columns the run covers.
     pub(crate) fn row_runs(&self, row: usize) -> Vec<CellRun> {
         let mut runs: Vec<CellRun> = Vec::new();
         let mut col = 0;
@@ -343,6 +355,7 @@ impl TerminalGrid {
                     CellRun {
                         col,
                         width: if cell.wide { 2 } else { 1 },
+                        wide: cell.wide,
                         text: cell.text,
                         fg,
                         bg,
@@ -357,6 +370,7 @@ impl TerminalGrid {
                 None => CellRun {
                     col,
                     width: 1,
+                    wide: false,
                     text: String::new(),
                     fg: self.default_fg,
                     bg: self.default_bg,
@@ -366,6 +380,12 @@ impl TerminalGrid {
 
             let width = run.width;
             if let Some(prev) = runs.last_mut()
+                // Wide characters never merge: their glyph comes from a CJK
+                // fallback face that advances one em instead of the two cells
+                // they cover, so a merged run would render short and leave the
+                // grid-anchored cursor drifting away from the text.
+                && !prev.wide
+                && !run.wide
                 && prev.fg == run.fg
                 && prev.bg == run.bg
                 && prev.underline == run.underline
@@ -404,12 +424,12 @@ impl TerminalGrid {
             return None;
         }
         let (row, col) = self.cursor_pos();
-        let (text, cell_fg, cell_bg) = match self.get_cell(row, col) {
+        let (text, cell_fg, cell_bg, wide) = match self.get_cell(row, col) {
             Some(cell) => {
                 let (fg, bg) = self.resolve_cell_colors(&cell);
-                (cell.text, fg, bg)
+                (cell.text, fg, bg, cell.wide)
             }
-            None => (String::new(), Color32::WHITE, self.default_bg),
+            None => (String::new(), Color32::WHITE, self.default_bg, false),
         };
         // Solid-block cursor: paint with the cell foreground, falling back to
         // white when foreground and background are indistinguishable.
@@ -426,6 +446,7 @@ impl TerminalGrid {
             text,
             fg,
             bg,
+            wide,
             shape,
         })
     }
@@ -474,6 +495,10 @@ pub(crate) struct CellRun {
     pub col: usize,
     /// Width in terminal columns (2 for wide characters).
     pub width: usize,
+    /// True when the run holds a single wide character. Such a run is never
+    /// merged with its neighbours, so a renderer can anchor the glyph to its
+    /// lead column instead of relying on the font advance.
+    pub wide: bool,
     pub text: String,
     pub fg: Color32,
     pub bg: Color32,
@@ -488,6 +513,9 @@ pub(crate) struct CursorInfo {
     pub text: String,
     pub fg: Color32,
     pub bg: Color32,
+    /// The cell under the cursor holds a wide character, so a block cursor has
+    /// to cover both of its columns.
+    pub wide: bool,
     pub shape: CursorShape,
 }
 
@@ -532,6 +560,83 @@ mod tests {
     }
 
     #[test]
+    fn row_runs_keeps_wide_characters_anchored_to_their_lead_column() {
+        let mut grid = TerminalGrid::new(6, 1);
+        grid.process_pty_bytes("a中b".as_bytes());
+        let runs = grid.row_runs(0);
+        // Each run is drawn at its own column, so neither neighbour may absorb
+        // the wide character: the CJK glyph advances one em, not two cells.
+        assert_eq!(runs.len(), 4);
+        assert_eq!(
+            (runs[0].col, runs[0].width, runs[0].text.as_str()),
+            (0, 1, "a")
+        );
+        assert!(!runs[0].wide);
+        assert_eq!(
+            (runs[1].col, runs[1].width, runs[1].text.as_str()),
+            (1, 2, "中")
+        );
+        assert!(runs[1].wide);
+        assert_eq!(
+            (runs[2].col, runs[2].width, runs[2].text.as_str()),
+            (3, 1, "b")
+        );
+        assert!(!runs[2].wide);
+        assert!(runs[3].text.is_empty());
+    }
+
+    #[test]
+    fn row_runs_keeps_neighbouring_wide_characters_in_separate_runs() {
+        let mut grid = TerminalGrid::new(4, 1);
+        grid.process_pty_bytes("中文".as_bytes());
+        let runs = grid.row_runs(0);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(
+            (runs[0].col, runs[0].width, runs[0].text.as_str()),
+            (0, 2, "中")
+        );
+        assert_eq!(
+            (runs[1].col, runs[1].width, runs[1].text.as_str()),
+            (2, 2, "文")
+        );
+        assert!(runs[0].wide && runs[1].wide);
+    }
+
+    #[test]
+    fn display_cells_follows_terminal_width_not_byte_length() {
+        assert_eq!(display_cells('a'), 1);
+        assert_eq!(display_cells('中'), 2);
+        assert_eq!(display_cells('，'), 2);
+        // Combining acute accent: drawn on the cell it marks, not a new one.
+        assert_eq!(display_cells('\u{0301}'), 0);
+    }
+
+    #[test]
+    fn display_cells_matches_the_columns_the_grid_assigns() {
+        // The renderer finds each character's column by accumulating
+        // `display_cells` over the run text, so it has to agree with the
+        // widths the grid itself used when it placed the cells — otherwise
+        // glyphs would land on the wrong columns even though each one is
+        // anchored, only now with the error spread unevenly.
+        for ch in [
+            'a', 'W', 'é', '±', 'Ω', '→', '─', '中', '，', 'ｱ', 'ｶ', '한', '😀', '❤', '\u{fe0f}',
+            '\u{200d}', '\u{f015}',
+        ] {
+            let mut grid = TerminalGrid::new(8, 1);
+            grid.process_pty_bytes(ch.to_string().as_bytes());
+            let (row, col) = grid.cursor_pos();
+            assert_eq!(row, 0, "U+{:04X} wrapped", ch as u32);
+            assert_eq!(
+                col,
+                display_cells(ch),
+                "U+{:04X} takes {col} column(s) in the grid, display_cells says {}",
+                ch as u32,
+                display_cells(ch)
+            );
+        }
+    }
+
+    #[test]
     fn row_runs_keeps_distant_text_separate_across_blank_cells() {
         let mut grid = TerminalGrid::new(10, 1);
         grid.process_pty_bytes(b" \x1b[6Gat");
@@ -560,6 +665,25 @@ mod tests {
         let mut grid = TerminalGrid::new(4, 1);
         grid.process_pty_bytes(b"\x1b[?25l");
         assert!(grid.cursor().is_none());
+    }
+
+    #[test]
+    fn cursor_reports_a_wide_cell_underneath_it() {
+        let mut grid = TerminalGrid::new(8, 1);
+        // "中文" occupies columns 0-1 and 2-3, so a cursor moved back two
+        // columns sits on the leading half of "文".
+        grid.process_pty_bytes("中文".as_bytes());
+        grid.process_pty_bytes(b"\x1b[2D");
+        let cursor = grid.cursor().expect("cursor should be visible");
+        assert_eq!((cursor.row, cursor.col), (0, 2));
+        assert!(cursor.wide, "the cursor block must cover both columns");
+        assert_eq!(cursor.text, "文");
+
+        // A narrow cell keeps the one-column cursor.
+        grid.process_pty_bytes(b"\x1b[5G");
+        let cursor = grid.cursor().expect("cursor should be visible");
+        assert_eq!((cursor.row, cursor.col), (0, 4));
+        assert!(!cursor.wide);
     }
 
     #[test]
