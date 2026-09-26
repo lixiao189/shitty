@@ -6,8 +6,10 @@ use crate::terminal::keymap;
 use crate::terminal::selection::Selection;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, Sel};
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
-use objc2_app_kit::{NSEvent, NSTextInputClient, NSView};
+use objc2::{
+    AllocAnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+};
+use objc2_app_kit::{NSEvent, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSView};
 use objc2_foundation::{
     NSArray, NSAttributedString, NSAttributedStringKey, NSNotFound, NSPoint, NSRange, NSRect,
     NSSize, NSUInteger,
@@ -73,6 +75,8 @@ define_class!(
                     }
                     TabBarHit::NewTab => self.create_tab(state),
                 }
+                // The tab count changed under the pointer, so re-aim the hover.
+                self.update_tab_bar_hover(event);
                 return;
             }
 
@@ -90,6 +94,22 @@ define_class!(
                 window.makeFirstResponder(Some(self));
             }
             self.setNeedsDisplay(true);
+        }
+
+        #[unsafe(method(mouseMoved:))]
+        fn mouse_moved(&self, event: &NSEvent) {
+            self.update_tab_bar_hover(event);
+        }
+
+        #[unsafe(method(mouseExited:))]
+        fn mouse_exited(&self, _event: &NSEvent) {
+            let state_ptr = self.ivars().state;
+            let Some(state) = (unsafe { state_ptr.as_mut() }) else {
+                return;
+            };
+            if state.tab_bar_hover.take().is_some() {
+                self.setNeedsDisplay(true);
+            }
         }
 
         #[unsafe(method(mouseDragged:))]
@@ -434,6 +454,21 @@ impl ShittyTerminalView {
             ]
         };
         view.record_grid_size(view.bounds().size);
+        // Pointer tracking for the tab strip's hover highlights; `InVisibleRect`
+        // keeps the area matched to the view as it resizes.
+        let tracking = unsafe {
+            NSTrackingArea::initWithRect_options_owner_userInfo(
+                NSTrackingArea::alloc(),
+                NSRect::ZERO,
+                NSTrackingAreaOptions::MouseEnteredAndExited
+                    | NSTrackingAreaOptions::MouseMoved
+                    | NSTrackingAreaOptions::ActiveInKeyWindow
+                    | NSTrackingAreaOptions::InVisibleRect,
+                Some(&view),
+                None,
+            )
+        };
+        view.addTrackingArea(&tracking);
         // Register the view with the wake handle so the PTY reader thread can
         // trigger coalesced drain+redraw passes from now on.
         view.ivars().wake.attach(Retained::as_ptr(&view).cast_mut());
@@ -460,6 +495,21 @@ impl ShittyTerminalView {
             (x / state.cell_width) as usize,
         );
         state.active().grid.snap_cell_pos(pos)
+    }
+
+    /// Track which tab-strip control is under the pointer, repainting only
+    /// when that changes.
+    fn update_tab_bar_hover(&self, event: &NSEvent) {
+        let state_ptr = self.ivars().state;
+        let Some(state) = (unsafe { state_ptr.as_mut() }) else {
+            return;
+        };
+        let location = self.convertPoint_fromView(event.locationInWindow(), None);
+        let hover = tab_bar_hit(location, self.bounds(), state.sessions.len());
+        if hover != state.tab_bar_hover {
+            state.tab_bar_hover = hover;
+            self.setNeedsDisplay(true);
+        }
     }
 
     /// Close the window, which the app delegate turns into a full quit.

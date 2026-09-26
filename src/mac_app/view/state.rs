@@ -18,6 +18,7 @@ use std::cell::RefCell;
 use std::error::Error;
 
 use super::glyphs::GlyphCache;
+use super::tab_bar::TabBarHit;
 use super::wake::ViewWake;
 
 /// Cap on PTY bytes parsed per event so a huge burst never freezes the main thread.
@@ -45,6 +46,8 @@ pub(in crate::mac_app) struct TerminalViewState {
     pub(super) glyphs: RefCell<GlyphCache>,
     /// Shared with the PTY reader threads, which signal it when output arrives.
     pub(super) wake: Retained<ViewWake>,
+    /// The tab-strip control under the pointer, for hover highlights.
+    pub(super) tab_bar_hover: Option<TabBarHit>,
 }
 
 impl TerminalViewState {
@@ -71,6 +74,7 @@ impl TerminalViewState {
             resize_task_scheduled: false,
             glyphs,
             wake: ViewWake::new(),
+            tab_bar_hover: None,
         };
         // The first size is applied by the view once it knows its bounds.
         state.spawn_session(80, 24)?;
