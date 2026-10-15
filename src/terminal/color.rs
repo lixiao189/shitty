@@ -20,11 +20,6 @@ impl Color32 {
     pub const WHITE: Self = Self::from_rgb(255, 255, 255);
 }
 
-pub(crate) const DEFAULT_FG: Color32 = Color32::from_rgb(204, 204, 204);
-pub(crate) const DEFAULT_BG: Color32 = Color32::BLACK;
-/// Translucent highlight drawn behind selected cells.
-pub(crate) const SELECTION_BG: Color32 = Color32::from_rgba(70, 110, 220, 110);
-
 // Lookup table for RGB levels used in xterm 256 color mode
 const RGB_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
 

@@ -1,6 +1,7 @@
 use crate::terminal::grid::TerminalGrid;
 use crate::terminal::pty::{Pty, PtyEvent};
 use crate::terminal::selection::Selection;
+use crate::terminal::theme::Theme;
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,6 +9,15 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 /// Label shown on a tab whose shell has not set a title.
 const DEFAULT_TITLE: &str = "zsh";
+
+/// Size and theme a new session is opened with.
+pub(crate) struct SessionOptions {
+    pub cols: usize,
+    pub rows: usize,
+    pub cell_width: f64,
+    pub cell_height: f64,
+    pub theme: Theme,
+}
 
 /// One shell session: its own PTY, grid, channels, and view state.
 ///
@@ -36,18 +46,21 @@ pub(crate) struct TerminalSession {
 impl TerminalSession {
     pub(crate) fn spawn(
         id: u64,
-        cols: usize,
-        rows: usize,
-        cell_width: f64,
-        cell_height: f64,
+        options: SessionOptions,
         on_output: impl Fn() + Send + 'static,
         on_exit: impl Fn() + Send + 'static,
     ) -> Result<Self, Box<dyn Error>> {
         let pty = Pty::spawn()?;
         let (tx_output, rx_output) = channel::<Vec<u8>>();
         let (tx_input, rx_input) = channel::<PtyEvent>();
-        let grid =
-            TerminalGrid::new_with_pty_size(cols, rows, tx_input.clone(), cell_width, cell_height);
+        let mut grid = TerminalGrid::new_with_pty_size(
+            options.cols,
+            options.rows,
+            tx_input.clone(),
+            options.cell_width,
+            options.cell_height,
+        );
+        grid.set_theme(options.theme);
         let exited = Arc::new(AtomicBool::new(false));
         let exited_flag = exited.clone();
         pty.spawn_threads(tx_output, rx_input, on_output, move || {
@@ -132,8 +145,19 @@ mod tests {
 
     #[test]
     fn dropping_a_session_hangs_up_its_shell() {
-        let session = TerminalSession::spawn(1, 80, 24, 8.0, 16.0, || {}, || {})
-            .expect("session should spawn a shell");
+        let session = TerminalSession::spawn(
+            1,
+            SessionOptions {
+                cols: 80,
+                rows: 24,
+                cell_width: 8.0,
+                cell_height: 16.0,
+                theme: Theme::Default,
+            },
+            || {},
+            || {},
+        )
+        .expect("session should spawn a shell");
         assert!(!session.exited());
         assert_eq!(session.display_title(), "zsh");
 

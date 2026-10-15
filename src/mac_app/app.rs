@@ -5,8 +5,8 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSAutoresizingMaskOptions,
-    NSBackingStoreType, NSImage, NSMenu, NSMenuItem, NSResponder, NSWindow, NSWindowDelegate,
-    NSWindowStyleMask,
+    NSBackingStoreType, NSControlStateValueOff, NSControlStateValueOn, NSImage, NSMenu, NSMenuItem,
+    NSResponder, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString, ns_string};
 use std::cell::RefCell;
@@ -14,6 +14,7 @@ use std::error::Error;
 
 use super::font::{DEFAULT_FONT_SIZE, load_terminal_font, measure_cell_size};
 use super::view::{ShittyTerminalView, TerminalViewState};
+use crate::terminal::theme::{self, Theme};
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     let mtm = MainThreadMarker::new().ok_or("must be on main thread")?;
@@ -175,7 +176,7 @@ impl ShittyAppDelegate {
 fn terminal_view_state() -> Result<TerminalViewState, Box<dyn Error>> {
     let font = load_terminal_font(DEFAULT_FONT_SIZE);
     let (cell_width, cell_height) = measure_cell_size(&font);
-    TerminalViewState::new(font, cell_width, cell_height)
+    TerminalViewState::new(font, cell_width, cell_height, theme::configured_theme())
 }
 
 struct AppDelegateIvars {
@@ -262,6 +263,73 @@ fn setup_main_menu(mtm: MainThreadMarker) {
         macos_next_tab_menu_item_spec(),
         sel!(selectNextTab:),
     );
+
+    add_theme_menu(mtm, &menubar);
+}
+
+/// View menu listing every built-in theme. Each item carries its theme's
+/// index as a tag, and the one read from the config starts out checked.
+fn add_theme_menu(mtm: MainThreadMarker, menubar: &NSMenu) {
+    let view_menu_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            ns_string!("View"),
+            None,
+            ns_string!(""),
+        )
+    };
+    menubar.addItem(&view_menu_item);
+
+    let view_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("View"));
+    view_menu_item.setSubmenu(Some(&view_menu));
+
+    let active = theme::configured_theme();
+    for theme in Theme::NAMES.map(|name| Theme::parse(name).expect("theme name round-trips")) {
+        let title = NSString::from_str(theme.menu_title());
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &title,
+                Some(sel!(selectTheme:)),
+                ns_string!(""),
+            )
+        };
+        item.setTag(theme as isize);
+        if theme == active {
+            item.setState(NSControlStateValueOn);
+        }
+        view_menu.addItem(&item);
+    }
+}
+
+/// Move the checkmark to the theme the user just picked. The view applies the
+/// colors; the menu only reflects which one is current.
+pub(super) fn mark_theme_menu(theme: Theme) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let Some(menubar) = NSApplication::sharedApplication(mtm).mainMenu() else {
+        return;
+    };
+    let Some(view_menu) = (0..menubar.numberOfItems())
+        .filter_map(|index| menubar.itemAtIndex(index))
+        .filter_map(|item| item.submenu())
+        .find(|menu| menu.title().to_string() == "View")
+    else {
+        return;
+    };
+    let selected = theme as isize;
+    for index in 0..view_menu.numberOfItems() {
+        let Some(item) = view_menu.itemAtIndex(index) else {
+            continue;
+        };
+        let state = if item.tag() == selected {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        };
+        item.setState(state);
+    }
 }
 
 fn add_shortcut_item(

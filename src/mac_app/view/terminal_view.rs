@@ -1,9 +1,11 @@
 //! The `NSView` subclass: its Objective-C surface, event handling, and the
 //! `NSTextInputClient` (IME) conformance.
 
+use crate::mac_app::app::mark_theme_menu;
 use crate::terminal::grid::CellPos;
 use crate::terminal::keymap;
 use crate::terminal::selection::Selection;
+use crate::terminal::theme::{self, Theme};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool, Sel};
 use objc2::{
@@ -183,6 +185,26 @@ define_class!(
         #[unsafe(method(selectPreviousTab:))]
         fn select_previous_tab(&self, _sender: Option<&AnyObject>) {
             self.select_relative_tab(-1);
+        }
+
+        #[unsafe(method(selectTheme:))]
+        fn select_theme(&self, sender: Option<&AnyObject>) {
+            let Some(item) = sender else {
+                return;
+            };
+            let index: isize = unsafe { msg_send![item, tag] };
+            let Some(theme) = Theme::NAMES.get(index as usize).copied().and_then(Theme::parse)
+            else {
+                return;
+            };
+            let state_ptr = self.ivars().state;
+            let Some(state) = (unsafe { state_ptr.as_mut() }) else {
+                return;
+            };
+            state.set_theme(theme);
+            theme::save_theme(theme);
+            mark_theme_menu(theme);
+            self.setNeedsDisplay(true);
         }
 
         #[unsafe(method(keyDown:))]

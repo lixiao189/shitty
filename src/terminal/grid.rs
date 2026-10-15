@@ -1,5 +1,6 @@
-use crate::terminal::color::{Color32, DEFAULT_BG, DEFAULT_FG, ansi_16_color, xterm_256_color};
+use crate::terminal::color::{Color32, xterm_256_color};
 use crate::terminal::pty::PtyEvent;
+use crate::terminal::theme::{ColorScheme, Theme};
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point};
@@ -68,8 +69,8 @@ pub(crate) struct TerminalGrid {
     term: Term<EventBuffer>,
     parser: Processor,
     palette: [Option<Color32>; 256],
-    default_fg: Color32,
-    default_bg: Color32,
+    /// Named colors for the active theme. Indexed overrides in `palette` win.
+    scheme: ColorScheme,
     has_changes: bool,
     cell_width: f64,
     cell_height: f64,
@@ -93,8 +94,7 @@ impl TerminalGrid {
             term: Term::new(config, &GridSize { cols, rows }, listener),
             parser: Processor::new(),
             palette: [None; 256],
-            default_fg: DEFAULT_FG,
-            default_bg: DEFAULT_BG,
+            scheme: Theme::Default.scheme(),
             has_changes: false,
             cell_width: 1.0,
             cell_height: 1.0,
@@ -136,7 +136,19 @@ impl TerminalGrid {
     }
 
     pub(crate) fn default_bg(&self) -> Color32 {
-        self.default_bg
+        self.scheme.bg
+    }
+
+    /// Highlight drawn behind a selection; themes tint it to match.
+    pub(crate) fn selection_bg(&self) -> Color32 {
+        self.scheme.selection
+    }
+
+    /// Retint the grid to `theme`. Cells that name a color pick it up on the
+    /// next paint; cells with an explicit RGB stay as the application set them.
+    pub(crate) fn set_theme(&mut self, theme: Theme) {
+        self.scheme = theme.scheme();
+        self.has_changes = true;
     }
 
     /// The title set by the shell (OSC 0/2), if any.
@@ -212,18 +224,16 @@ impl TerminalGrid {
     fn color_for_index(&self, index: usize) -> Option<Color32> {
         match index {
             0..=255 => Some(self.palette[index].unwrap_or_else(|| {
-                if index < 16 {
-                    ansi_16_color(index as u8)
-                } else {
-                    xterm_256_color(index as u8)
-                }
+                self.scheme
+                    .ansi(index as u8)
+                    .unwrap_or_else(|| xterm_256_color(index as u8))
             })),
-            256 => Some(self.default_fg),
-            257 => Some(self.default_bg),
+            256 => Some(self.scheme.fg),
+            257 => Some(self.scheme.bg),
             258 => Some(Color32::WHITE),
-            259..=266 => Some(ansi_16_color((index - 259) as u8)),
-            267 => Some(self.default_fg),
-            268 => Some(self.default_bg),
+            259..=266 => Some(self.scheme.ansi[index - 259]),
+            267 => Some(self.scheme.fg),
+            268 => Some(self.scheme.bg),
             _ => None,
         }
     }
@@ -372,8 +382,8 @@ impl TerminalGrid {
                     width: 1,
                     wide: false,
                     text: String::new(),
-                    fg: self.default_fg,
-                    bg: self.default_bg,
+                    fg: self.scheme.fg,
+                    bg: self.scheme.bg,
                     underline: false,
                 },
             };
@@ -429,7 +439,7 @@ impl TerminalGrid {
                 let (fg, bg) = self.resolve_cell_colors(&cell);
                 (cell.text, fg, bg, cell.wide)
             }
-            None => (String::new(), Color32::WHITE, self.default_bg, false),
+            None => (String::new(), self.scheme.fg, self.scheme.bg, false),
         };
         // Solid-block cursor: paint with the cell foreground, falling back to
         // white when foreground and background are indistinguishable.
@@ -453,11 +463,13 @@ impl TerminalGrid {
 
     fn resolve_color(&self, color: Color) -> Color32 {
         match color {
-            Color::Named(NamedColor::Foreground) => self.default_fg,
-            Color::Named(NamedColor::Background) => self.default_bg,
+            Color::Named(NamedColor::Foreground) => self.scheme.fg,
+            Color::Named(NamedColor::Background) => self.scheme.bg,
             Color::Named(named) => self.resolve_named_color(named),
             Color::Indexed(idx) => {
                 if let Some(color) = self.palette[idx as usize] {
+                    color
+                } else if let Some(color) = self.scheme.ansi(idx) {
                     color
                 } else {
                     xterm_256_color(idx)
@@ -469,11 +481,11 @@ impl TerminalGrid {
 
     fn resolve_named_color(&self, named: NamedColor) -> Color32 {
         match named as usize {
-            0..=15 => ansi_16_color(named as usize as u8),
+            0..=15 => self.scheme.ansi[named as usize],
             258 => Color32::WHITE,
-            259..=266 => ansi_16_color((named as usize - 259) as u8),
-            267 | 268 => self.default_fg,
-            _ => self.default_fg,
+            259..=266 => self.scheme.ansi[named as usize - 259],
+            267 | 268 => self.scheme.fg,
+            _ => self.scheme.fg,
         }
     }
 }
@@ -533,6 +545,28 @@ mod tests {
         assert_eq!(runs[0].width, 2);
         assert_eq!(runs[0].text, "ab");
         assert!(runs[1].text.is_empty());
+    }
+
+    #[test]
+    fn a_theme_recolors_named_colors_already_on_screen() {
+        let mut grid = TerminalGrid::new(6, 1);
+        grid.set_theme(Theme::CatppuccinMocha);
+        grid.process_pty_bytes(b"\x1b[31mred\x1b[0m");
+
+        let scheme = Theme::CatppuccinMocha.scheme();
+        assert_eq!(grid.default_bg(), scheme.bg);
+        assert_eq!(
+            grid.get_cell(0, 0).map(|cell| cell.fg),
+            Some(scheme.ansi[1])
+        );
+
+        grid.set_theme(Theme::CatppuccinLatte);
+        let scheme = Theme::CatppuccinLatte.scheme();
+        assert_eq!(grid.default_bg(), scheme.bg);
+        assert_eq!(
+            grid.get_cell(0, 0).map(|cell| cell.fg),
+            Some(scheme.ansi[1])
+        );
     }
 
     #[test]

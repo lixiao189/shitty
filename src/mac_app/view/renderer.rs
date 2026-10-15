@@ -1,7 +1,7 @@
 //! Painting of the terminal surface: cells, cursor, selection, and the
 //! in-progress input-method text.
 
-use crate::terminal::color::{Color32, SELECTION_BG};
+use crate::terminal::color::Color32;
 use crate::terminal::grid::{CursorInfo, display_cells};
 use crate::terminal::selection::Selection;
 use crate::terminal::session::TerminalSession;
@@ -574,12 +574,7 @@ fn paint_selection_overlay(
     cell_width: f64,
     cell_height: f64,
 ) {
-    let color = NSColor::colorWithSRGBRed_green_blue_alpha(
-        SELECTION_BG.r as f64 / 255.0,
-        SELECTION_BG.g as f64 / 255.0,
-        SELECTION_BG.b as f64 / 255.0,
-        SELECTION_BG.a as f64 / 255.0,
-    );
+    let color = to_nscolor(session.grid.selection_bg());
     color.set();
     for row in 0..session.grid.rows() {
         let mut col = 0;

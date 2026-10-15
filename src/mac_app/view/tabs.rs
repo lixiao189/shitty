@@ -1,6 +1,6 @@
 //! Tab management: the session list, tab commands, and tab key shortcuts.
 
-use crate::terminal::session::TerminalSession;
+use crate::terminal::session::{SessionOptions, TerminalSession};
 use objc2::DefinedClass;
 use objc2_app_kit::{NSEvent, NSEventModifierFlags};
 use std::error::Error;
@@ -24,10 +24,13 @@ impl TerminalViewState {
         let wake_exit = self.wake.clone();
         let session = TerminalSession::spawn(
             id,
-            cols,
-            rows,
-            self.cell_width,
-            self.cell_height,
+            SessionOptions {
+                cols,
+                rows,
+                cell_width: self.cell_width,
+                cell_height: self.cell_height,
+                theme: self.theme,
+            },
             move || wake_output.signal_output(),
             move || wake_exit.signal_exit(),
         )?;
@@ -209,8 +212,13 @@ mod tests {
     fn view_state_opens_and_closes_tabs() {
         let font = load_terminal_font(DEFAULT_FONT_SIZE);
         let (cell_width, cell_height) = measure_cell_size(&font);
-        let mut state =
-            TerminalViewState::new(font, cell_width, cell_height).expect("first tab spawns");
+        let mut state = TerminalViewState::new(
+            font,
+            cell_width,
+            cell_height,
+            crate::terminal::theme::Theme::Default,
+        )
+        .expect("first tab spawns");
 
         assert_eq!(state.sessions.len(), 1);
         assert_eq!(state.active, 0);

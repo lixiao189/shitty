@@ -5,3 +5,4 @@ pub(crate) mod pty;
 pub(crate) mod resize;
 pub(crate) mod selection;
 pub(crate) mod session;
+pub(crate) mod theme;

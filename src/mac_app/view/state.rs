@@ -11,6 +11,7 @@ use crate::mac_app::font::{
 use crate::terminal::keymap;
 use crate::terminal::resize::ResizeDebouncer;
 use crate::terminal::session::TerminalSession;
+use crate::terminal::theme::Theme;
 use objc2::rc::{Retained, autoreleasepool};
 use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSFont, NSPasteboard, NSPasteboardTypeString};
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
@@ -48,6 +49,8 @@ pub(in crate::mac_app) struct TerminalViewState {
     pub(super) wake: Retained<ViewWake>,
     /// The tab-strip control under the pointer, for hover highlights.
     pub(super) tab_bar_hover: Option<TabBarHit>,
+    /// Theme applied to every tab, including ones opened later.
+    pub(super) theme: Theme,
 }
 
 impl TerminalViewState {
@@ -55,6 +58,7 @@ impl TerminalViewState {
         font: Retained<NSFont>,
         cell_width: f64,
         cell_height: f64,
+        theme: Theme,
     ) -> Result<Self, Box<dyn Error>> {
         let font_size = font.pointSize();
         let glyphs = RefCell::new(GlyphCache::new(&font));
@@ -75,6 +79,7 @@ impl TerminalViewState {
             glyphs,
             wake: ViewWake::new(),
             tab_bar_hover: None,
+            theme,
         };
         // The first size is applied by the view once it knows its bounds.
         state.spawn_session(80, 24)?;
@@ -93,6 +98,14 @@ impl TerminalViewState {
 
     pub(super) fn send_input(&mut self, bytes: Vec<u8>) {
         self.active_mut().send_input(bytes);
+    }
+
+    /// Recolor every open tab. New tabs inherit the same theme.
+    pub(super) fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+        for session in &mut self.sessions {
+            session.grid.set_theme(theme);
+        }
     }
 
     /// Clipboard shortcuts (⌘C copy / ⌘V paste, ESC cancels selection).
