@@ -2,8 +2,8 @@
 //! through the same [`GridView`](crate::terminal::grid::GridView) the renderer paints.
 //!
 //! - [`vtebench`] — the vtebench workloads from `third_party/vtebench`.
-//! - [`pi`] — the `pi` coding agent's TUI, skipped when `pi` is not installed.
+//! - [`vim`] — Vim as a fullscreen TUI, skipped when `vim` is not installed.
 
 mod harness;
-mod pi;
+mod vim;
 mod vtebench;
