@@ -30,8 +30,7 @@ cargo build
 cargo build --release
 cargo clippy
 cargo fmt
-cargo test                    # unit + e2e (vtebench workloads, pi agent TUI)
-cargo test e2e -- --ignored   # also a live pi agent turn
+cargo test                    # unit + e2e (vtebench workloads, vim TUI)
 ```
 
 The e2e suite needs the vtebench submodule: `git submodule update --init`.

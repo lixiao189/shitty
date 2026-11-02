@@ -16,8 +16,7 @@ cargo build --release     # release build
 cargo run                 # build and run
 cargo clippy              # lint
 cargo fmt                 # format
-cargo test                # inline unit tests + e2e (vtebench, pi)
-cargo test e2e -- --ignored  # also the live pi agent turn (needs model credentials)
+cargo test                # inline unit tests + e2e (vtebench, vim)
 ```
 
 The binary is output to `target_local/` (custom dir set in `.cargo/config.toml`).
@@ -32,7 +31,7 @@ UI Main Thread (AppKit)
     │  rx_output ◄─ PTY Read Thread  ◄── PTY master FD ◄── zsh (slave)
 ```
 
-**E2E tests** (`e2e/`, `#[cfg(test)]`): `harness.rs` drives a real `TerminalSession` (PTY + `zsh -f` + libghostty) headlessly and reads the screen through `GridView`. `vtebench.rs` replays every workload from the `third_party/vtebench` git submodule (run `git submodule update --init` after cloning) and asserts the final screen; `pi.rs` drives the `pi` coding agent's TUI and skips when `pi` is not on `PATH`. Dev builds compile Ghostty as `ReleaseFast` (a profile override in `Cargo.toml`); Zig `Debug` scrolls too slowly for these tests.
+**E2E tests** (`e2e/`, `#[cfg(test)]`): `harness.rs` drives a real `TerminalSession` (PTY + `zsh -f` + libghostty) headlessly and reads the screen through `GridView`. `vtebench.rs` replays every workload from the `third_party/vtebench` git submodule (run `git submodule update --init` after cloning) and asserts the final screen; `vim.rs` drives Vim (preinstalled on macOS) as a fullscreen TUI and skips when `vim` is not on `PATH`. Dev builds compile Ghostty as `ReleaseFast` (a profile override in `Cargo.toml`); Zig `Debug` scrolls too slowly for these tests.
 
 **Entry point** (`main.rs`): calls `mac_app::run()`.
 

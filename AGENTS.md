@@ -17,7 +17,7 @@ This is **Shitty**, a small terminal emulator written in Rust (2024 edition). Th
 - `src/mac_app/chrome/` — tab commands, the scrollbar, and the tab strip (`tab_bar/layout.rs` for hits, `tab_bar/paint.rs` for drawing).
 - `src/mac_app/layout/` — rectangles shared by the tab strip and the grid.
 - `src/mac_app/font/` — bundled face and cell metrics.
-- `src/e2e/` — test-only end-to-end suite: a headless `TerminalSession` harness, the vtebench workloads, and the `pi` agent TUI.
+- `src/e2e/` — test-only end-to-end suite: a headless `TerminalSession` harness, the vtebench workloads, and Vim as a fullscreen TUI.
 - `third_party/vtebench/` — git submodule with alacritty's vtebench; run `git submodule update --init` after cloning.
 - `assets/` — bundled Nerd Font variants and images (e.g., `arch.png`, `icon.png`).
 - `target_local/` — build output; the custom target dir is set in `.cargo/config.toml`.
@@ -35,7 +35,6 @@ cargo run            # build and run the terminal locally
 cargo clippy         # lint; keep it warning-free
 cargo fmt            # format the codebase
 cargo test           # run all inline unit tests and the e2e suite
-cargo test e2e -- --ignored  # also the live pi agent turn (needs model credentials)
 ```
 
 ## Coding Style & Naming Conventions
