@@ -1,0 +1,35 @@
+#!/bin/sh
+# Pinned Zig toolchain for libghostty-vt-sys (selected via ZIG in .cargo/config.toml).
+# Downloads the official release once, verifies its SHA-256, caches it, then execs it.
+set -eu
+
+ZIG_VERSION=0.17.0 # must satisfy Ghostty's build.zig.zon minimum_zig_version
+
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64) platform=aarch64-macos sha=b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a ;;
+  Darwin-x86_64) platform=x86_64-macos sha=4f9a1c5269aa17ebda5e6d3c2b89d6cbf36f7d2b22a0306e9ab98f25f95529c6 ;;
+  Linux-aarch64) platform=aarch64-linux sha=9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8 ;;
+  Linux-x86_64) platform=x86_64-linux sha=1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026 ;;
+  *) echo "tools/zig: unsupported host $(uname -s)-$(uname -m); set ZIG to a Zig $ZIG_VERSION binary" >&2; exit 1 ;;
+esac
+
+name="zig-$platform-$ZIG_VERSION"
+root="${SHITTY_ZIG_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/shitty/zig}"
+zig="$root/$name/zig"
+
+if [ ! -x "$zig" ]; then
+  mkdir -p "$root"
+  tmp="$(mktemp -d "$root/.download.XXXXXX")"
+  trap 'rm -rf "$tmp"' EXIT
+  echo "tools/zig: fetching $name" >&2
+  curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/$name.tar.xz" -o "$tmp/zig.tar.xz"
+  echo "$sha  $tmp/zig.tar.xz" | shasum -a 256 -c - >/dev/null || {
+    echo "tools/zig: checksum mismatch for $name" >&2
+    exit 1
+  }
+  tar -xJf "$tmp/zig.tar.xz" -C "$tmp"
+  rm -rf "${root:?}/$name"
+  mv "$tmp/$name" "$root/$name" # atomic publish; concurrent builds race harmlessly
+fi
+
+exec "$zig" "$@"

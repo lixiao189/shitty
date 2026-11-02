@@ -5,8 +5,10 @@ edition = "2024"
 
 [dependencies]
 nix = { version = "0.31.1", features = ["term"] }
-alacritty_terminal = "0.26.0"
-unicode-width = "0.2.2"
+# crates.io 0.2.2 vendors a Ghostty commit that requires Zig 0.15.2.
+# Master (still versioned 0.2.1) pins Ghostty for Zig 0.17, which is what
+# this tree builds with. The rev is exact.
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "575ed6b8ceb79ffaf247ecf7e34333876b0d5be4" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.3"
@@ -15,3 +17,10 @@ objc2-foundation = "0.3.2"
 objc2-core-foundation = "0.3.2"
 objc2-core-text = "0.3.2"
 objc2-core-graphics = "0.3.2"
+
+# Dev builds otherwise compile Ghostty with Zig's `Debug` mode, which scrolls
+# ~1.5k lines/s and makes the vtebench e2e tests time out. The sys crate's
+# build script picks `ReleaseFast` when its own profile is optimized.
+[profile.dev.package.libghostty-vt-sys]
+opt-level = 3
+debug = false

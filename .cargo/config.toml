@@ -1,2 +1,7 @@
 [build]
 target-dir = "target_local"
+
+[env]
+# libghostty-vt-sys builds Ghostty with `$ZIG`; use the pinned, checksum-verified
+# wrapper. A ZIG already set in the environment wins (force = false).
+ZIG = { value = "tools/zig", relative = true }
