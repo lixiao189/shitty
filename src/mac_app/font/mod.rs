@@ -78,7 +78,7 @@ fn embedded_monaco_postscript_names() -> &'static [String] {
         let mut postscript_names = Vec::<String>::new();
 
         for rel_path in font_paths {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel_path);
+            let path = super::asset_path(rel_path);
             if !path.exists() {
                 continue;
             }

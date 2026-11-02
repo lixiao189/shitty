@@ -1,0 +1,149 @@
+name: Release
+
+# Official releases: push a tag `vX.Y.Z` that matches Cargo.toml's version.
+# Nightly: every day at 03:17 UTC from main, skipped when main has not moved
+# since the last nightly. Run it by hand with `gh workflow run release.yml`.
+on:
+  push:
+    tags: ["v*"]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Publish a nightly even if main has not changed
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Decide what to release
+    runs-on: ubuntu-latest
+    outputs:
+      kind: ${{ steps.plan.outputs.kind }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Plan
+        id: plan
+        env:
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -eu
+          base="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          sha="$(git rev-parse HEAD)"
+
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag="$GITHUB_REF_NAME"
+            if [ "$tag" != "v$base" ]; then
+              echo "::error::tag $tag does not match Cargo.toml version $base (expected v$base)"
+              exit 1
+            fi
+            echo "kind=release version=$base tag=$tag"
+            { echo kind=release; echo "version=$base"; echo "tag=$tag"; echo publish=true; } >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::nightlies are built from main, not $GITHUB_REF"
+            exit 1
+          fi
+
+          version="$base-nightly.$(date -u +%Y%m%d)+$(git rev-parse --short=7 HEAD)"
+          last="$(git ls-remote --tags origin refs/tags/nightly | cut -f1)"
+          publish=true
+          if [ "$last" = "$sha" ] && [ "${FORCE:-false}" != true ]; then
+            echo "main is still at $sha, the last nightly; skipping"
+            publish=false
+          fi
+          echo "kind=nightly version=$version publish=$publish"
+          { echo kind=nightly; echo "version=$version"; echo tag=nightly; echo "publish=$publish"; } >>"$GITHUB_OUTPUT"
+
+  ci:
+    name: CI
+    needs: prepare
+    if: needs.prepare.outputs.publish == 'true'
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Package (macOS arm64)
+    needs: [prepare, ci]
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Cache Zig
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/shitty/zig
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/zig') }}
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target_local"
+          key: release-zig-${{ hashFiles('tools/zig') }}
+
+      - name: Build and package
+        run: tools/package-macos.sh "${{ needs.prepare.outputs.version }}" dist
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: packages
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish ${{ needs.prepare.outputs.kind }}
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      KIND: ${{ needs.prepare.outputs.kind }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v8
+        with:
+          name: packages
+          path: dist
+
+      - name: Publish release
+        run: |
+          set -eu
+          ls -l dist
+          if [ "$KIND" = release ]; then
+            prerelease=""
+            case "$VERSION" in *-*) prerelease=--prerelease ;; esac
+            gh release create "$TAG" dist/* --verify-tag --generate-notes \
+              --title "Shitty $VERSION" $prerelease
+          else
+            # One rolling `nightly` release: drop the previous one and its tag,
+            # then tag this commit.
+            gh release delete nightly --cleanup-tag --yes 2>/dev/null || true
+            notes="Automated nightly build of main at ${GITHUB_SHA}.
+
+          Version \`$VERSION\`. Built $(date -u '+%Y-%m-%d %H:%M UTC').
+
+          The app is ad-hoc signed, not notarized: the first time, right-click Shitty.app and choose Open."
+            gh release create nightly dist/* --prerelease --target "$GITHUB_SHA" \
+              --title "Nightly $VERSION" --notes "$notes"
+          fi

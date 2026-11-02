@@ -1,3 +1,4 @@
 .alma-snapshots
 target*
 .DS_Store
+dist

@@ -37,6 +37,21 @@ The e2e suite needs the vtebench submodule: `git submodule update --init`.
 
 Binary output: `target_local/` (see `.cargo/config.toml`).
 
+## Releases
+
+`.github/workflows/release.yml` publishes `Shitty.app` (Apple Silicon) as a `.zip`
+and a `.dmg`, each with a SHA-256 file, on the GitHub Releases page. Every release
+runs the full CI suite first.
+
+- **Official:** bump `version` in `Cargo.toml`, merge to `main`, then
+  `git tag v0.2.0 && git push origin v0.2.0`. The tag must match `Cargo.toml`.
+- **Nightly:** built from `main` every day at 03:17 UTC as the rolling `nightly`
+  pre-release; skipped when `main` has not changed. Run it now with
+  `gh workflow run release.yml` (add `-f force=true` to rebuild an unchanged `main`).
+
+To package locally: `tools/package-macos.sh 0.1.0` (writes to `dist/`).
+Builds are ad-hoc signed, not notarized: open the app the first time with right-click > Open.
+
 ## Features
 
 - ANSI/VT parsing via `alacritty_terminal` with a cell grid model.
