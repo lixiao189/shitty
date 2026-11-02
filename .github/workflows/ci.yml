@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    name: fmt, clippy, test
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Cache Zig
+        uses: actions/cache@v6
+        with:
+          # tools/zig downloads the pinned, checksum-verified release here.
+          path: ~/.cache/shitty/zig
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/zig') }}
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          # .cargo/config.toml sets build.target-dir = "target_local", not "target".
+          # This action caches ~/.cargo/registry, ~/.cargo/git, and that directory.
+          workspaces: ". -> target_local"
+          # Ghostty objects in the target dir are produced by the Zig in tools/zig.
+          key: zig-${{ hashFiles('tools/zig') }}
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        # Unit tests plus e2e: the vtebench workloads and vim (preinstalled on macOS).
+        run: cargo test
