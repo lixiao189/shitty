@@ -19,8 +19,8 @@ pub(crate) struct Harness {
 
 impl Harness {
     /// Open a session at `cols`×`rows`, then swap the login shell for a bare
-    /// `zsh -f` so the user's dotfiles cannot change prompts or timing. `TERM`
-    /// is pinned because the PTY does not set it and `tput` needs it.
+    /// `zsh -f` so the user's dotfiles cannot change prompts or timing. The
+    /// environment the PTY sets (`TERM`, `LANG`, …) survives the `exec`.
     pub(crate) fn spawn(cols: usize, rows: usize) -> Self {
         let session = TerminalSession::spawn(
             1,
@@ -42,7 +42,7 @@ impl Harness {
             markers: 0,
         };
         harness.run("exec /bin/zsh -f");
-        harness.run("export TERM=xterm-256color PS1='$ ' PROMPT_EOL_MARK=''");
+        harness.run("export PS1='$ ' PROMPT_EOL_MARK=''");
         harness.run_to_completion("true", Duration::from_secs(10));
         harness
     }
