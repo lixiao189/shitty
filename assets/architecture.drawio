@@ -1,0 +1,99 @@
+<mxfile host="drawio">
+  <diagram id="arch" name="Architecture">
+    <mxGraphModel dx="1400" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="0" pageScale="1" pageWidth="1400" pageHeight="600" background="#FFFFFF" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- Lanes -->
+        <mxCell id="laneUI" value="UI main thread (AppKit)" style="rounded=1;arcSize=4;whiteSpace=wrap;html=1;fillColor=#F5F8FD;strokeColor=#6C8EBF;dashed=1;verticalAlign=top;align=left;spacingLeft=12;spacingTop=6;fontStyle=1;fontSize=14;fontColor=#3A5A8C;" vertex="1" parent="1">
+          <mxGeometry x="20" y="20" width="560" height="400" as="geometry" />
+        </mxCell>
+        <mxCell id="laneWorkers" value="PTY worker threads (per tab)" style="rounded=1;arcSize=4;whiteSpace=wrap;html=1;fillColor=#FFF8EF;strokeColor=#D79B00;dashed=1;verticalAlign=top;align=left;spacingLeft=12;spacingTop=6;fontStyle=1;fontSize=14;fontColor=#9A6A00;" vertex="1" parent="1">
+          <mxGeometry x="640" y="20" width="260" height="400" as="geometry" />
+        </mxCell>
+        <mxCell id="laneOS" value="Kernel + child process" style="rounded=1;arcSize=4;whiteSpace=wrap;html=1;fillColor=#F4FAF2;strokeColor=#82B366;dashed=1;verticalAlign=top;align=left;spacingLeft=12;spacingTop=6;fontStyle=1;fontSize=14;fontColor=#4F7A3A;" vertex="1" parent="1">
+          <mxGeometry x="960" y="20" width="440" height="400" as="geometry" />
+        </mxCell>
+
+        <!-- UI main thread -->
+        <mxCell id="render" value="&lt;b&gt;Renderer&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;paint_terminal · GlyphCache&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="50" y="80" width="210" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="view" value="&lt;b&gt;ShittyTerminalView&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;NSView · keys · IME · mouse&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="340" y="80" width="210" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="grid" value="&lt;b&gt;TerminalGrid&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;libghostty-vt parser · scrollback&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="50" y="200" width="210" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="session" value="&lt;b&gt;TerminalSession&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;one per tab · resize debounce 150 ms&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="340" y="200" width="210" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="wake" value="&lt;b&gt;ViewWake&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;coalesces output bursts · 8 ms&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DAE8FC;strokeColor=#6C8EBF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="340" y="320" width="210" height="64" as="geometry" />
+        </mxCell>
+
+        <!-- Workers -->
+        <mxCell id="writer" value="&lt;b&gt;Write thread&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;input bytes · TIOCSWINSZ&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="665" y="80" width="210" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="reader" value="&lt;b&gt;Read thread&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;8 KiB reads · EOF = exit&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFE6CC;strokeColor=#D79B00;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="665" y="320" width="210" height="64" as="geometry" />
+        </mxCell>
+
+        <!-- Kernel -->
+        <mxCell id="master" value="&lt;b&gt;PTY master fd&lt;/b&gt;" style="rounded=1;arcSize=6;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="990" y="80" width="150" height="304" as="geometry" />
+        </mxCell>
+        <mxCell id="zsh" value="&lt;b&gt;/bin/zsh&lt;/b&gt;&lt;br&gt;&lt;font style=&quot;font-size:11px&quot;&gt;login shell on PTY slave&lt;br&gt;TERM=xterm-256color&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#D5E8D4;strokeColor=#82B366;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="194" width="170" height="76" as="geometry" />
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e1" value="keys · paste" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#555555;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="view" target="session">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" value="tx_input&lt;br&gt;PtyEvent" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#555555;fontSize=11;labelBackgroundColor=#FFFFFF;exitX=1;exitY=0.3;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="session" target="writer">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="595" y="219" />
+              <mxPoint x="595" y="112" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e3" value="write()" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#555555;fontSize=11;labelBackgroundColor=#FFFFFF;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.105;entryDx=0;entryDy=0;" edge="1" parent="1" source="writer" target="master">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e4" value="read()" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#555555;fontSize=11;labelBackgroundColor=#FFFFFF;exitX=0;exitY=0.895;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="master" target="reader">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;startArrow=block;startFill=1;endArrow=block;endFill=1;strokeColor=#555555;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="master" target="zsh">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6" value="tx_output&lt;br&gt;Vec&amp;lt;u8&amp;gt;" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#555555;fontSize=11;labelBackgroundColor=#FFFFFF;exitX=0;exitY=0.3;exitDx=0;exitDy=0;entryX=1;entryY=0.7;entryDx=0;entryDy=0;" edge="1" parent="1" source="reader" target="session">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="615" y="339" />
+              <mxPoint x="615" y="245" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e7" value="on_output()" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#555555;fontSize=11;labelBackgroundColor=#FFFFFF;exitX=0;exitY=0.75;exitDx=0;exitDy=0;entryX=1;entryY=0.75;entryDx=0;entryDy=0;dashed=1;" edge="1" parent="1" source="reader" target="wake">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e8" value="drain" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#555555;fontSize=11;labelBackgroundColor=#FFFFFF;dashed=1;" edge="1" parent="1" source="wake" target="session">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e9" value="parse" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#555555;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="session" target="grid">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e10" value="GridView" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#555555;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="grid" target="render">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e11" value="drawRect" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeColor=#555555;fontSize=11;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="render" target="view">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

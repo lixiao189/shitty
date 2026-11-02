@@ -1,121 +1,79 @@
 # Shitty
 
-```
-        _            _       _     _        _          _    _        _
-       / /\         / /\    / /\  /\ \     /\ \       /\ \ /\ \     /\_\
-      / /  \       / / /   / / /  \ \ \    \_\ \      \_\ \\ \ \   / / /
-     / / /\ \__   / /_/   / / /   /\ \_\   /\__ \     /\__ \\ \ \_/ / /
-    / / /\ \___\ / /\ \__/ / /   / /\/_/  / /_ \ \   / /_ \ \\ \___/ /
-    \ \ \ \/___// /\ \___\/ /   / / /    / / /\ \ \ / / /\ \ \\ \ \_/
-     \ \ \     / / /\/___/ /   / / /    / / /  \/_// / /  \/_/ \ \ \
- _    \ \ \   / / /   / / /   / / /    / / /      / / /         \ \ \
-/_/\__/ / /  / / /   / / /___/ / /__  / / /      / / /           \ \ \
-\ \/___/ /  / / /   / / //\__\/_/___\/_/ /      /_/ /             \ \_\
- \_____\/   \/_/    \/_/ \/_________/\_\/       \_\/               \/_/
-```
+<img height="128" alt="Shitty Icon" src="assets/icon.png" align="left"> *A tiny native macOS terminal emulator written by <a href="https://github.com/lixiao189">@lixiao189</a> and implemented in <a href="https://www.rust-lang.org/">Rust</a>, with VT parsing by <a href="https://github.com/Uzaaft/libghostty-rs">libghostty-vt</a>*
 
-A tiny terminal emulator in Rust. Uses [libghostty-vt](https://github.com/Uzaaft/libghostty-rs)
-(Ghostty's VT parser) for parsing, a PTY for the shell, and a native AppKit renderer on macOS.
+It draws with AppKit, parses with Ghostty's VT engine, and runs `zsh` on a real PTY in every tab.
 
-## Quick Start
+<br clear="left">
+
+## Installation
+
+Download `Shitty.app` (Apple Silicon) from the
+[Releases page](https://github.com/lixiao189/shitty/releases):
+
+* **Stable:** tagged `vX.Y.Z` releases.
+* **Nightly:** the rolling [`nightly`](https://github.com/lixiao189/shitty/releases/tag/nightly)
+  pre-release, rebuilt from `main` every day.
+
+Each release ships a `.zip` and a `.dmg`, each with a SHA-256 file. Builds are
+ad-hoc signed and not notarized, so open the app the first time with
+right-click → **Open**.
+
+### Building from source
+
+You need Rust (2024 edition) on macOS. Zig 0.17 is needed to build
+libghostty-vt, but you don't have to install it: `tools/zig` downloads a pinned,
+checksum-verified copy into `~/.cache/shitty/zig/` on the first build. Export
+`ZIG` to use your own.
 
 ```bash
-cargo run
+git clone https://github.com/lixiao189/shitty.git
+cd shitty
+cargo run --release
 ```
 
-Other useful commands:
-
-```bash
-cargo build
-cargo build --release
-cargo clippy
-cargo fmt
-cargo test                    # unit + e2e (vtebench workloads, vim TUI)
-```
-
-The e2e suite needs the vtebench submodule: `git submodule update --init`.
-
-Binary output: `target_local/` (see `.cargo/config.toml`).
-
-## Releases
-
-`.github/workflows/release.yml` publishes `Shitty.app` (Apple Silicon) as a `.zip`
-and a `.dmg`, each with a SHA-256 file, on the GitHub Releases page. Every release
-runs the full CI suite first.
-
-- **Official:** bump `version` in `Cargo.toml`, merge to `main`, then
-  `git tag v0.2.0 && git push origin v0.2.0`. The tag must match `Cargo.toml`.
-- **Nightly:** built from `main` every day at 03:17 UTC as the rolling `nightly`
-  pre-release; skipped when `main` has not changed. Run it now with
-  `gh workflow run release.yml` (add `-f force=true` to rebuild an unchanged `main`).
-
-To package locally: `tools/package-macos.sh 0.1.0` (writes to `dist/`).
-Builds are ad-hoc signed, not notarized: open the app the first time with right-click > Open.
+Build output goes to `target_local/`. To package a local `Shitty.app`, `.zip` and
+`.dmg` into `dist/`, run `tools/package-macos.sh 0.1.0`.
 
 ## Features
 
-- ANSI/VT parsing via `libghostty-vt` with a cell grid model.
-- PTY-backed shell (`/bin/zsh`) with proper resize signaling.
-- ANSI 16-color, xterm 256-color, and truecolor RGB support.
-- Wide-character handling and underline rendering.
-- Cursor rendering with inverse cell colors and DECSCUSR shape support.
-- 1000-row scrollback with a scrollbar and mouse-wheel scrolling.
-- Mouse text selection with clipboard copy/paste (⌘C/⌘V, ESC clears selection).
-- Font zoom (⌘+/⌘−/⌘0) and IME composition support.
-- macOS AppKit renderer with native key handling.
-- Nerd Font monospace rendering (bundled fonts in `assets/`).
+* VT/ANSI parsing by `libghostty-vt`: 16-color, xterm 256-color and truecolor,
+  wide characters, underlines, and DECSCUSR cursor shapes.
+* Tabs, each with its own login shell started in `$HOME` with `TERM`, `COLORTERM`
+  and `LANG` set, so it behaves the same when launched from Finder or the Dock.
+* 1000 rows of scrollback with a scrollbar and mouse-wheel scrolling.
+* Mouse selection with clipboard copy and paste (⌘C / ⌘V, Esc clears).
+* Font zoom (⌘+ / ⌘− / ⌘0), IME composition, and a bundled Monaco Nerd Font.
+* Color themes from the **View** menu, saved to `~/.config/shitty/config.toml`
+  (override with `SHITTY_THEME` or `SHITTY_CONFIG`).
 
 ## Architecture
 
-![Architecture](assets/arch.png)
+![Shitty architecture](assets/architecture.png)
 
-### Core Data Flow
+The UI thread owns every session; the two PTY threads per tab only move bytes.
+Output bursts are coalesced for 8 ms into one drain on the main run loop, and a
+window resize is applied to the grid and the PTY together once the size has been
+stable for 150 ms, so output is never parsed at a width it wasn't generated for.
 
-```mermaid
-flowchart LR
-  APP[NSApp + NSWindow] --> VIEW[ShittyTerminalView]
-  VIEW --> GRID[TerminalGrid + libghostty-vt parser]
-  VIEW -- key events --> TX[tx_pty_input]
-  TX --> W[PTY Write Thread]
-  W --> MFD[PTY master FD]
-  MFD --> SHELL["/bin/zsh (PTY slave)"]
-  SHELL --> MFD
-  MFD --> R[PTY Read Thread]
-  R --> RX[rx_pty_output]
-  RX --> VIEW
+The diagram source is [`assets/architecture.drawio`](assets/architecture.drawio);
+edit it in [draw.io](https://www.drawio.com/) and re-export the PNG.
+
+## Contributing
+
+`main` is protected, so changes go through a pull request. CI runs the same three
+checks you can run locally:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test                     # unit tests + e2e (vtebench workloads, Vim)
 ```
 
-## Project Layout
+The e2e suite needs the vtebench submodule: `git submodule update --init`.
+See [`CLAUDE.md`](CLAUDE.md) for the module layout and conventions.
 
-- `src/main.rs`: binary entry point calling `shitty::mac_app::run()`; `src/lib.rs` is the library root.
-- `src/terminal/`: platform-independent terminal core.
-  - `grid/`: the libghostty-vt `Terminal` and scrollback (`term/`), plus the
-    read-only `GridView` (`view.rs`) the UI paints from. The only module that
-    imports `libghostty_vt`.
-  - `io/`: PTY spawn and IO threads (`pty.rs`), per-tab `TerminalSession`
-    (`session.rs`), and resize debouncing (`resize.rs`).
-  - `input/`: AppKit key and paste translation to terminal bytes.
-  - `theme/`: named themes, palettes, `Color32`, and the config file.
-  - `selection/`: cell-range selection over a `GridView`.
-- `src/mac_app/`: native AppKit UI.
-  - `app/`: `NSApplication` launch, the window, and the main menu (`menu.rs`).
-  - `shell/`: the `NSView` subclass, window state, IME, and the PTY wake bridge.
-  - `render/`: glyph cache and painting (cells, text, cursor, selection).
-  - `chrome/`: tabs, the tab strip, and the scrollbar.
-  - `layout/`: rectangles shared by the tab strip and the grid.
-  - `font/`: the bundled face and cell metrics.
-- `src/e2e/`: test-only end-to-end suite (vtebench workloads, Vim, shell environment).
+## Getting help
 
-## Notes
-
-- Rendering is event-driven: PTY output is coalesced on the main run loop
-  (8ms debounce) and redraws go through `setNeedsDisplay`/`drawRect`.
-- Window resizes are debounced for 150ms, then applied to the grid and PTY together.
-- Resizes propagate through TIOCSWINSZ and SIGWINCH to keep shells happy.
-
-## Build Requirements
-
-- Rust 2024 edition (see `Cargo.toml`).
-- Zig 0.17 to build libghostty-vt. `tools/zig` downloads a pinned, checksum-verified
-  copy into `~/.cache/shitty/zig/` on first build; export `ZIG` to use your own.
-- macOS-only build; uses objc2 + AppKit frameworks (no extra setup required).
+Use the [GitHub issue tracker](https://github.com/lixiao189/shitty/issues) to see
+if someone else has hit the same problem, or to file a new one.
