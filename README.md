@@ -14,8 +14,8 @@
  \_____\/   \/_/    \/_/ \/_________/\_\/       \_\/               \/_/
 ```
 
-A tiny terminal emulator in Rust. Uses alacritty_terminal for parsing, a PTY for the shell,
-and a native AppKit renderer on macOS.
+A tiny terminal emulator in Rust. Uses [libghostty-vt](https://github.com/Uzaaft/libghostty-rs)
+(Ghostty's VT parser) for parsing, a PTY for the shell, and a native AppKit renderer on macOS.
 
 ## Quick Start
 
@@ -54,7 +54,7 @@ Builds are ad-hoc signed, not notarized: open the app the first time with right-
 
 ## Features
 
-- ANSI/VT parsing via `alacritty_terminal` with a cell grid model.
+- ANSI/VT parsing via `libghostty-vt` with a cell grid model.
 - PTY-backed shell (`/bin/zsh`) with proper resize signaling.
 - ANSI 16-color, xterm 256-color, and truecolor RGB support.
 - Wide-character handling and underline rendering.
@@ -74,7 +74,7 @@ Builds are ad-hoc signed, not notarized: open the app the first time with right-
 ```mermaid
 flowchart LR
   APP[NSApp + NSWindow] --> VIEW[ShittyTerminalView]
-  VIEW --> GRID[TerminalGrid + alacritty_terminal parser]
+  VIEW --> GRID[TerminalGrid + libghostty-vt parser]
   VIEW -- key events --> TX[tx_pty_input]
   TX --> W[PTY Write Thread]
   W --> MFD[PTY master FD]
@@ -87,24 +87,24 @@ flowchart LR
 
 ## Project Layout
 
-- `src/lib.rs`: library root exposing the `mac_app` module.
-- `src/main.rs`: binary entry point calling `shitty::mac_app::run()`.
-- `src/mac_app/`: native AppKit UI — `app.rs` (bootstrap, menu, window),
-  `view/` (terminal view, split by component), `font.rs` (font loading).
-- `src/mac_app/view/`: `mod.rs` (module wiring), `terminal_view.rs` (NSView
-  subclass, events, IME), `state.rs` (view-wide state), `tabs.rs` (tab list and
-  tab commands), `tab_bar.rs` (tab strip drawing and hit testing),
-  `scrollbar.rs` (scrollbar and scrolling), `renderer.rs` (cells, cursor,
-  selection, marked text), `resize.rs` (debounced resize reflow),
-  `geometry.rs` (bounds ↔ grid math), `ime.rs` (composition state), `wake.rs`
-  (PTY event bridge).
-- `src/terminal/mod.rs`: terminal module exports.
-- `src/terminal/grid.rs`: alacritty_terminal parser wrapper and grid access.
-- `src/terminal/color.rs`: ANSI/xterm color mapping.
-- `src/terminal/keymap.rs`: key event translation (AppKit).
-- `src/terminal/pty.rs`: PTY session lifecycle, resize handling, and IO threads.
-- `src/terminal/resize.rs`: resize debounce coalescing (grid + PTY resized together).
-- `src/terminal/selection.rs`: line-based text selection and extraction.
+- `src/main.rs`: binary entry point calling `shitty::mac_app::run()`; `src/lib.rs` is the library root.
+- `src/terminal/`: platform-independent terminal core.
+  - `grid/`: the libghostty-vt `Terminal` and scrollback (`term/`), plus the
+    read-only `GridView` (`view.rs`) the UI paints from. The only module that
+    imports `libghostty_vt`.
+  - `io/`: PTY spawn and IO threads (`pty.rs`), per-tab `TerminalSession`
+    (`session.rs`), and resize debouncing (`resize.rs`).
+  - `input/`: AppKit key and paste translation to terminal bytes.
+  - `theme/`: named themes, palettes, `Color32`, and the config file.
+  - `selection/`: cell-range selection over a `GridView`.
+- `src/mac_app/`: native AppKit UI.
+  - `app/`: `NSApplication` launch, the window, and the main menu (`menu.rs`).
+  - `shell/`: the `NSView` subclass, window state, IME, and the PTY wake bridge.
+  - `render/`: glyph cache and painting (cells, text, cursor, selection).
+  - `chrome/`: tabs, the tab strip, and the scrollbar.
+  - `layout/`: rectangles shared by the tab strip and the grid.
+  - `font/`: the bundled face and cell metrics.
+- `src/e2e/`: test-only end-to-end suite (vtebench workloads, Vim, shell environment).
 
 ## Notes
 
@@ -116,4 +116,6 @@ flowchart LR
 ## Build Requirements
 
 - Rust 2024 edition (see `Cargo.toml`).
+- Zig 0.17 to build libghostty-vt. `tools/zig` downloads a pinned, checksum-verified
+  copy into `~/.cache/shitty/zig/` on first build; export `ZIG` to use your own.
 - macOS-only build; uses objc2 + AppKit frameworks (no extra setup required).
