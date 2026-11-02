@@ -36,7 +36,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 }
 
 fn load_app_icon() -> Option<Retained<NSImage>> {
-    let icon_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icon.png");
+    let icon_path = super::asset_path("assets/icon.png");
     if !icon_path.exists() {
         eprintln!("Warning: Icon file not found at {:?}", icon_path);
         return None;
