@@ -6,7 +6,7 @@
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol, Sel};
 use objc2::{AnyThread, DefinedClass, define_class, msg_send, sel};
-use objc2_foundation::NSObject;
+use objc2_foundation::{NSArray, NSObject, NSRunLoopCommonModes};
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::time::Duration;
 
@@ -103,23 +103,27 @@ impl ViewWake {
     }
 
     fn perform_on_main(&self, selector: Sel) {
+        let modes = NSArray::from_slice(&[unsafe { NSRunLoopCommonModes }]);
         unsafe {
             let _: () = msg_send![
                 self,
                 performSelectorOnMainThread: selector,
                 withObject: None::<&AnyObject>,
-                waitUntilDone: false
+                waitUntilDone: false,
+                modes: &*modes
             ];
         }
     }
 
     fn perform_after_delay(&self, selector: Sel, delay: Duration) {
+        let modes = NSArray::from_slice(&[unsafe { NSRunLoopCommonModes }]);
         unsafe {
             let _: () = msg_send![
                 self,
                 performSelector: selector,
                 withObject: None::<&AnyObject>,
-                afterDelay: delay.as_secs_f64()
+                afterDelay: delay.as_secs_f64(),
+                inModes: &*modes
             ];
         }
     }

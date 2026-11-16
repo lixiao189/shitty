@@ -148,7 +148,7 @@ impl TerminalGrid {
     }
 
     pub(crate) fn cursor_pos(&self) -> (usize, usize) {
-        let row = usize::from(self.term.cursor_y().unwrap_or(0)) + self.scroll_offset();
+        let row = usize::from(self.term.cursor_y().unwrap_or(0));
         let col = usize::from(self.term.cursor_x().unwrap_or(0));
         (row, col)
     }
@@ -192,14 +192,12 @@ impl TerminalGrid {
     }
 
     /// How many scrollback rows are available above the screen right now.
-    #[cfg(target_os = "macos")]
     pub(crate) fn max_scroll(&self) -> usize {
         self.scroll_metrics().1
     }
 
     /// Scroll the view so it starts `offset` rows above the bottom. Returns
     /// whether the offset actually changed.
-    #[cfg(target_os = "macos")]
     pub(crate) fn scroll_to(&mut self, offset: usize) -> bool {
         let (_, max) = self.scroll_metrics();
         let target = offset.min(max);
@@ -209,12 +207,12 @@ impl TerminalGrid {
         // libghostty's row is counted from the top of the scrollback.
         let top = max - target;
         self.term.scroll_viewport(ScrollViewport::Row(top));
+        self.has_changes = true;
         true
     }
 
     /// Scroll by `delta` rows; positive moves toward older history, negative
     /// back toward the live screen. Returns whether the offset changed.
-    #[cfg(target_os = "macos")]
     pub(crate) fn scroll_by(&mut self, delta: isize) -> bool {
         let (offset, max) = self.scroll_metrics();
         let target = (offset as isize + delta).clamp(0, max as isize) as usize;
@@ -408,7 +406,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn scrollback_accumulates_history() {
         let mut grid = TerminalGrid::new(4, 2);
@@ -420,7 +417,6 @@ mod tests {
         assert_eq!(grid.max_scroll(), 4);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn scroll_to_top_reveals_oldest_lines() {
         let mut grid = TerminalGrid::new(4, 2);
@@ -433,7 +429,6 @@ mod tests {
         assert_eq!(grid.get_cell(1, 0).map(|c| c.text), Some("b".into()));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn scroll_offset_clamps_to_available_history() {
         let mut grid = TerminalGrid::new(4, 2);
@@ -448,7 +443,6 @@ mod tests {
         assert!(!grid.scroll_to(2));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn scroll_by_moves_and_clamps() {
         let mut grid = TerminalGrid::new(4, 2);
@@ -464,8 +458,6 @@ mod tests {
         assert!(!grid.scroll_by(-100));
     }
 
-    #[cfg(target_os = "macos")]
-    #[cfg(target_os = "macos")]
     #[test]
     fn view_stays_pinned_to_same_content_while_scrolled() {
         let mut grid = TerminalGrid::new(4, 2);

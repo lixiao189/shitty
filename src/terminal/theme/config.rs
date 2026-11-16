@@ -78,7 +78,13 @@ fn set_theme_entry(text: &str, theme: Theme) -> String {
         let line = strip_comment(raw).trim();
         if line.starts_with('[') {
             // `[]` is still the root table; every other header leaves it.
-            in_root = line == "[theme]" || line == "[]";
+            let next_in_root = line == "[theme]" || line == "[]";
+            if in_root && !next_in_root && !replaced {
+                updated.push_str(&assignment);
+                updated.push('\n');
+                replaced = true;
+            }
+            in_root = next_in_root;
         }
         let is_theme_key = in_root
             && line
@@ -134,6 +140,7 @@ fn config_path() -> PathBuf {
         }
     }
     let mut path = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     path.push(".config");
@@ -265,5 +272,15 @@ mod tests {
             Some(Theme::CatppuccinLatte)
         );
         assert!(updated.starts_with("font_size = 14\n"));
+    }
+
+    #[test]
+    fn saving_a_theme_places_it_in_root_before_other_tables() {
+        let updated = set_theme_entry("[colors]\ntheme = \"latte\"\n", Theme::CatppuccinMocha);
+        assert_eq!(
+            theme_from_config(&updated).unwrap(),
+            Some(Theme::CatppuccinMocha)
+        );
+        assert!(updated.contains("[colors]\ntheme = \"latte\""));
     }
 }

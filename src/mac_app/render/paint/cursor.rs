@@ -122,6 +122,16 @@ pub(super) fn paint_marked_text(
     // anchored to its column, so composing CJK cannot slide away from the
     // cursor as the preedit grows. Combining marks stay on the cell they mark.
     let marked = state.marked_text();
+    let marked_cols = marked.chars().map(display_cells).sum::<usize>().max(1);
+    let marked_x0 = col_x(origin.x, cursor_col, state.cell_width, scale);
+    let marked_x1 = col_x(origin.x, cursor_col + marked_cols, state.cell_width, scale);
+    let marked_width = (marked_x1 - marked_x0).max(0.0);
+    to_nscolor(state.active().frame().default_bg()).set();
+    NSBezierPath::fillRect(NSRect::new(
+        NSPoint::new(marked_x0, marked_y0),
+        NSSize::new(marked_width, marked_rect_h),
+    ));
+
     marked_fg.set();
     TextPainter {
         state,
@@ -133,13 +143,8 @@ pub(super) fn paint_marked_text(
         text_y: marked_text_y,
     }
     .draw(marked, cursor_col);
-    let marked_cols = marked.chars().map(display_cells).sum::<usize>().max(1);
-    let marked_width = marked_cols as f64 * state.cell_width;
     let underline_rect = NSRect::new(
-        NSPoint::new(
-            col_x(origin.x, cursor_col, state.cell_width, scale),
-            marked_y0,
-        ),
+        NSPoint::new(marked_x0, marked_y0),
         NSSize::new(marked_width, 1.0),
     );
     marked_fg.set();

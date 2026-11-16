@@ -1,9 +1,9 @@
 //! Rust-side state owned by the terminal view: every tab plus the view-level
 //! state (font metrics, IME, resize debouncing) shared by them.
 //!
-//! Tab bookkeeping lives in [`super::tabs`], scrolling in
-//! [`super::scrollbar`], and composition state in [`super::ime`]; the fields
-//! below are shared by all of them.
+//! Tab bookkeeping and scrolling live in [`crate::mac_app::chrome`], and
+//! composition state in [`super::ime`]; the fields below are shared by all
+//! of them.
 
 use crate::mac_app::font::{
     DEFAULT_FONT_SIZE, FONT_SIZE_STEP, clamp_font_size, load_terminal_font, measure_cell_size,
@@ -115,11 +115,14 @@ impl TerminalViewState {
             .charactersIgnoringModifiers()
             .map(|s| s.to_string())
             .unwrap_or_default();
-        let has_command = event
-            .modifierFlags()
-            .contains(NSEventModifierFlags::Command);
+        let mods = event.modifierFlags().intersection(
+            NSEventModifierFlags::Command
+                | NSEventModifierFlags::Shift
+                | NSEventModifierFlags::Option
+                | NSEventModifierFlags::Control,
+        );
 
-        if has_command && characters.eq_ignore_ascii_case("c") {
+        if mods == NSEventModifierFlags::Command && characters.eq_ignore_ascii_case("c") {
             if self.active().selection.is_some() {
                 self.copy_selection();
             } else {
@@ -128,12 +131,12 @@ impl TerminalViewState {
             return true;
         }
 
-        if has_command && characters.eq_ignore_ascii_case("v") {
+        if mods == NSEventModifierFlags::Command && characters.eq_ignore_ascii_case("v") {
             self.paste_from_pasteboard();
             return true;
         }
 
-        if characters == "\u{1b}" && self.active().selection.is_some() {
+        if !self.ime_composing && characters == "\u{1b}" && self.active().selection.is_some() {
             self.active_mut().selection = None;
             return true;
         }

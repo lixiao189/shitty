@@ -18,13 +18,13 @@ use objc2::{
 };
 use objc2_app_kit::{NSEvent, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSView};
 use objc2_foundation::{
-    NSArray, NSAttributedString, NSAttributedStringKey, NSNotFound, NSPoint, NSRange, NSRect,
-    NSSize, NSUInteger,
+    NSArray, NSAttributedString, NSAttributedStringKey, NSPoint, NSRange, NSRect, NSSize,
+    NSUInteger,
 };
+use std::cell::RefCell;
 
 use super::ime;
 use super::state::TerminalViewState;
-use super::wake::ViewWake;
 
 define_class!(
     #[unsafe(super(NSView))]
@@ -51,38 +51,40 @@ define_class!(
 
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
-            let state_ptr = self.ivars().state;
-            let Some(state) = (unsafe { state_ptr.as_mut() }) else {
-                return;
-            };
             let location = self.convertPoint_fromView(event.locationInWindow(), None);
             let bounds = self.bounds();
+            let hit = tab_bar_hit(location, bounds, self.ivars().state.borrow().sessions.len());
 
-            if let Some(hit) = tab_bar_hit(location, bounds, state.sessions.len()) {
+            if let Some(hit) = hit {
                 if let Some(window) = self.window() {
                     window.makeFirstResponder(Some(self));
                 }
                 match hit {
-                    TabBarHit::Tab(index) => self.focus_tab(state, index),
-                    TabBarHit::Close(index) => self.close_tab_at(state, index),
-                    TabBarHit::NewTab => self.create_tab(state),
+                    TabBarHit::Tab(index) => self.select_tab_at(index),
+                    TabBarHit::Close(index) => self.close_tab_at(index),
+                    TabBarHit::NewTab => self.create_tab(),
                 }
                 // The tab count changed under the pointer, so re-aim the hover.
                 self.update_tab_bar_hover(event);
                 return;
             }
 
-            if state.active().frame().max_scroll() > 0
-                && location.x >= bounds.origin.x + bounds.size.width - SCROLLBAR_WIDTH
-            {
-                state.active_mut().scrollbar_dragging = true;
-                let track = scrollbar_track(terminal_bounds(bounds, state.show_tab_bar()));
-                state.scroll_to_track_y(location.y, track);
-                self.setNeedsDisplay(true);
-                return;
-            }
-            state.active_mut().selection = Some(Selection::start(self.cell_at_event(event)));
-            if let Some(window) = self.window() {
+            let handled_scrollbar = {
+                let mut state = self.ivars().state.borrow_mut();
+                if state.active().frame().max_scroll() > 0
+                    && location.x >= bounds.origin.x + bounds.size.width - SCROLLBAR_WIDTH
+                {
+                    state.active_mut().scrollbar_dragging = true;
+                    let track = scrollbar_track(terminal_bounds(bounds, state.show_tab_bar()));
+                    state.scroll_to_track_y(location.y, track);
+                    true
+                } else {
+                    let pos = self.cell_at_event(&state, event);
+                    state.active_mut().selection = Some(Selection::start(pos));
+                    false
+                }
+            };
+            if !handled_scrollbar && let Some(window) = self.window() {
                 window.makeFirstResponder(Some(self));
             }
             self.setNeedsDisplay(true);
@@ -95,71 +97,70 @@ define_class!(
 
         #[unsafe(method(mouseExited:))]
         fn mouse_exited(&self, _event: &NSEvent) {
-            let state_ptr = self.ivars().state;
-            let Some(state) = (unsafe { state_ptr.as_mut() }) else {
-                return;
-            };
-            if state.tab_bar_hover.take().is_some() {
+            let changed = self.ivars().state.borrow_mut().tab_bar_hover.take().is_some();
+            if changed {
                 self.setNeedsDisplay(true);
             }
         }
 
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &NSEvent) {
-            let state_ptr = self.ivars().state;
-            let Some(state) = (unsafe { state_ptr.as_mut() }) else {
-                return;
+            let needs_display = {
+                let mut state = self.ivars().state.borrow_mut();
+                if state.active().scrollbar_dragging {
+                    let location = self.convertPoint_fromView(event.locationInWindow(), None);
+                    let track =
+                        scrollbar_track(terminal_bounds(self.bounds(), state.show_tab_bar()));
+                    state.scroll_to_track_y(location.y, track);
+                    true
+                } else {
+                    let pos = self.cell_at_event(&state, event);
+                    if let Some(selection) = state.active_mut().selection.as_mut() {
+                        selection.set_head(pos);
+                        true
+                    } else {
+                        false
+                    }
+                }
             };
-            if state.active().scrollbar_dragging {
-                let location = self.convertPoint_fromView(event.locationInWindow(), None);
-                let track =
-                    scrollbar_track(terminal_bounds(self.bounds(), state.show_tab_bar()));
-                state.scroll_to_track_y(location.y, track);
-                self.setNeedsDisplay(true);
-                return;
-            }
-            if let Some(selection) = state.active_mut().selection.as_mut() {
-                selection.set_head(self.cell_at_event(event));
+            if needs_display {
                 self.setNeedsDisplay(true);
             }
         }
 
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, _event: &NSEvent) {
-            let state_ptr = self.ivars().state;
-            let Some(state) = (unsafe { state_ptr.as_mut() }) else {
-                return;
+            let cleared = {
+                let mut state = self.ivars().state.borrow_mut();
+                state.active_mut().scrollbar_dragging = false;
+                if state.active().selection.as_ref().is_some_and(|s| s.is_empty()) {
+                    state.active_mut().selection = None;
+                    true
+                } else {
+                    false
+                }
             };
-            state.active_mut().scrollbar_dragging = false;
-            if state.active().selection.as_ref().is_some_and(|s| s.is_empty()) {
-                state.active_mut().selection = None;
+            if cleared {
                 self.setNeedsDisplay(true);
             }
         }
 
         #[unsafe(method(scrollWheel:))]
         fn scroll_wheel(&self, event: &NSEvent) {
-            let state_ptr = self.ivars().state;
-            let Some(state) = (unsafe { state_ptr.as_mut() }) else {
-                return;
-            };
             let mut delta = event.scrollingDeltaY();
             // Non-precise wheels report notches; scale them to whole lines.
             if !event.hasPreciseScrollingDeltas() {
                 delta *= WHEEL_NOTCH_LINES;
             }
-            if state.scroll_by_wheel_delta(delta) {
+            let scrolled = self.ivars().state.borrow_mut().scroll_by_wheel_delta(delta);
+            if scrolled {
                 self.setNeedsDisplay(true);
             }
         }
 
         #[unsafe(method(newTab:))]
         fn new_tab(&self, _sender: Option<&AnyObject>) {
-            let state_ptr = self.ivars().state;
-            let Some(state) = (unsafe { state_ptr.as_mut() }) else {
-                return;
-            };
-            self.create_tab(state);
+            self.create_tab();
         }
 
         #[unsafe(method(closeTab:))]
@@ -183,15 +184,14 @@ define_class!(
                 return;
             };
             let index: isize = unsafe { msg_send![item, tag] };
-            let Some(theme) = Theme::NAMES.get(index as usize).copied().and_then(Theme::parse)
+            let Some(theme) = usize::try_from(index)
+                .ok()
+                .and_then(|i| Theme::NAMES.get(i).copied())
+                .and_then(Theme::parse)
             else {
                 return;
             };
-            let state_ptr = self.ivars().state;
-            let Some(state) = (unsafe { state_ptr.as_mut() }) else {
-                return;
-            };
-            state.set_theme(theme);
+            self.ivars().state.borrow_mut().set_theme(theme);
             theme::save_theme(theme);
             mark_theme_menu(theme);
             self.setNeedsDisplay(true);
@@ -199,18 +199,12 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
-            let state = unsafe { self.ivars().state.as_mut() };
-            super::keys::key_down(self, state, event);
+            super::keys::key_down(self, event);
         }
 
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty_rect: NSRect) {
-            let state_ptr = self.ivars().state;
-            if state_ptr.is_null() {
-                return;
-            }
-            let state = unsafe { &*state_ptr };
-
+            let state = self.ivars().state.borrow();
             let bounds = self.bounds();
             let show_tab_bar = state.show_tab_bar();
             let scale = self
@@ -218,7 +212,7 @@ define_class!(
                 .map(|window| window.backingScaleFactor())
                 .unwrap_or(1.0);
 
-            render::paint_terminal(state, bounds, scale);
+            render::paint_terminal(&state, bounds, scale);
 
             if state.active().frame().max_scroll() > 0 {
                 chrome::paint_scrollbar(
@@ -229,7 +223,7 @@ define_class!(
             }
 
             if show_tab_bar {
-                chrome::paint_tab_bar(state, bounds);
+                chrome::paint_tab_bar(&state, bounds);
             }
         }
     }
@@ -240,61 +234,59 @@ define_class!(
             let Some(text) = ime::ns_object_to_string(string) else {
                 return;
             };
-            let state_ptr = self.ivars().state;
-            let Some(state) = (unsafe { state_ptr.as_mut() }) else {
-                return;
-            };
+            {
+                let mut state = self.ivars().state.borrow_mut();
+                if state.commit_text() {
+                    state.skip_next_command = true;
+                }
 
-            if state.commit_text() {
-                state.skip_next_command = true;
+                let mut input_bytes = Vec::new();
+                keymap::append_input_from_text(&text, &mut input_bytes);
+                state.send_input(input_bytes);
             }
-
-            let mut input_bytes = Vec::new();
-            keymap::append_input_from_text(&text, &mut input_bytes);
-            state.send_input(input_bytes);
             self.setNeedsDisplay(true);
         }
 
         #[unsafe(method(doCommandBySelector:))]
         fn do_command_by_selector(&self, selector: Sel) {
-            let state_ptr = self.ivars().state;
-            let Some(state) = (unsafe { state_ptr.as_mut() }) else {
-                return;
-            };
-
-            if state.skip_next_command {
-                state.skip_next_command = false;
-                return;
-            }
-
-            // PageUp/PageDown scroll the local history instead of reaching
-            // the shell.
-            if let Ok(name) = selector.name().to_str() {
-                match name {
-                    "scrollPageUp:" | "scrollPageDown:" => {
-                        let rows = state.active().frame().rows() as isize;
-                        let lines = if name == "scrollPageUp:" { rows } else { -rows };
-                        state.scroll_by_lines(lines);
-                        self.setNeedsDisplay(true);
-                        return;
+            let needs_display = {
+                let mut state = self.ivars().state.borrow_mut();
+                if state.skip_next_command {
+                    state.skip_next_command = false;
+                    false
+                } else {
+                    match selector.name().to_str() {
+                        // PageUp/PageDown scroll the local history instead of reaching
+                        // the shell.
+                        Ok(name @ ("scrollPageUp:" | "scrollPageDown:")) => {
+                            let rows = state.active().frame().rows() as isize;
+                            let lines = if name == "scrollPageUp:" { rows } else { -rows };
+                            state.scroll_by_lines(lines);
+                            true
+                        }
+                        // Fallbacks for AppKit routing ⌘C/⌘V here directly.
+                        Ok("paste:") => {
+                            state.paste_from_pasteboard();
+                            true
+                        }
+                        Ok("copy:") => {
+                            state.copy_selection();
+                            false
+                        }
+                        _ => {
+                            let mut input_bytes = Vec::new();
+                            let sent =
+                                keymap::append_input_from_selector(selector, &mut input_bytes);
+                            if sent {
+                                state.send_input(input_bytes);
+                            }
+                            sent
+                        }
                     }
-                    // Fallbacks for AppKit routing ⌘C/⌘V here directly.
-                    "paste:" => {
-                        state.paste_from_pasteboard();
-                        self.setNeedsDisplay(true);
-                        return;
-                    }
-                    "copy:" => {
-                        state.copy_selection();
-                        return;
-                    }
-                    _ => {}
                 }
-            }
-
-            let mut input_bytes = Vec::new();
-            if keymap::append_input_from_selector(selector, &mut input_bytes) {
-                state.send_input(input_bytes);
+            };
+            if needs_display {
+                self.setNeedsDisplay(true);
             }
         }
 
@@ -306,51 +298,29 @@ define_class!(
             _replacement_range: NSRange,
         ) {
             let text = ime::ns_object_to_string(string).unwrap_or_default();
-            let state_ptr = self.ivars().state;
-            let Some(state) = (unsafe { state_ptr.as_mut() }) else {
-                return;
-            };
-
-            state.set_marked_text(text);
+            self.ivars().state.borrow_mut().set_marked_text(text);
             self.setNeedsDisplay(true);
         }
 
         #[unsafe(method(unmarkText))]
         fn unmark_text(&self) {
-            let state_ptr = self.ivars().state;
-            let Some(state) = (unsafe { state_ptr.as_mut() }) else {
-                return;
-            };
-
-            state.unmark_text();
+            self.ivars().state.borrow_mut().unmark_text();
             self.setNeedsDisplay(true);
         }
 
         #[unsafe(method(selectedRange))]
         fn selected_range(&self) -> NSRange {
-            let state_ptr = self.ivars().state;
-            let Some(state) = (unsafe { state_ptr.as_ref() }) else {
-                return NSRange::new(NSNotFound as NSUInteger, 0);
-            };
-            state.marked_text_range()
+            self.ivars().state.borrow().marked_text_range()
         }
 
         #[unsafe(method(markedRange))]
         fn marked_range(&self) -> NSRange {
-            let state_ptr = self.ivars().state;
-            let Some(state) = (unsafe { state_ptr.as_ref() }) else {
-                return NSRange::new(NSNotFound as NSUInteger, 0);
-            };
-            state.marked_text_range()
+            self.ivars().state.borrow().marked_text_range()
         }
 
         #[unsafe(method(hasMarkedText))]
         fn has_marked_text(&self) -> Bool {
-            let state_ptr = self.ivars().state;
-            let Some(state) = (unsafe { state_ptr.as_ref() }) else {
-                return Bool::NO;
-            };
-            state.has_marked_text().into()
+            self.ivars().state.borrow().has_marked_text().into()
         }
 
         #[unsafe(method_id(attributedSubstringForProposedRange:actualRange:))]
@@ -377,12 +347,11 @@ define_class!(
                 return NSRect::ZERO;
             };
 
-            let state_ptr = self.ivars().state;
-            let Some(state) = (unsafe { state_ptr.as_ref() }) else {
-                return NSRect::ZERO;
-            };
-
-            let view_rect = state.cursor_cell_rect(self.bounds());
+            let view_rect = self
+                .ivars()
+                .state
+                .borrow()
+                .cursor_cell_rect(self.bounds());
             window.convertRectToScreen(view_rect)
         }
 
@@ -398,11 +367,9 @@ impl ShittyTerminalView {
         mtm: MainThreadMarker,
         state: TerminalViewState,
     ) -> Retained<Self> {
-        let state_ptr = Box::into_raw(Box::new(state));
-        let wake = unsafe { (*state_ptr).wake.clone() };
+        let wake = state.wake.clone();
         let this = Self::alloc(mtm).set_ivars(TerminalViewIvars {
-            state: state_ptr,
-            wake,
+            state: RefCell::new(state),
         });
         let view: Retained<Self> = unsafe {
             msg_send![
@@ -428,7 +395,7 @@ impl ShittyTerminalView {
         view.addTrackingArea(&tracking);
         // Register the view with the wake handle so the PTY reader thread can
         // trigger coalesced drain+redraw passes from now on.
-        view.ivars().wake.attach(Retained::as_ptr(&view).cast_mut());
+        wake.attach(Retained::as_ptr(&view).cast_mut());
         // The shell may have printed its prompt before the view existed; its
         // bytes are still queued, so drain them once now.
         view.pty_output_ready();
@@ -437,11 +404,7 @@ impl ShittyTerminalView {
     }
 
     /// Convert a mouse event into a snapped grid cell.
-    fn cell_at_event(&self, event: &NSEvent) -> CellPos {
-        let state_ptr = self.ivars().state;
-        let Some(state) = (unsafe { state_ptr.as_ref() }) else {
-            return CellPos::new(0, 0);
-        };
+    fn cell_at_event(&self, state: &TerminalViewState, event: &NSEvent) -> CellPos {
         let bounds = self.bounds();
         let location = self.convertPoint_fromView(event.locationInWindow(), None);
         let x = (location.x - bounds.origin.x).max(0.0);
@@ -457,14 +420,16 @@ impl ShittyTerminalView {
     /// Track which tab-strip control is under the pointer, repainting only
     /// when that changes.
     fn update_tab_bar_hover(&self, event: &NSEvent) {
-        let state_ptr = self.ivars().state;
-        let Some(state) = (unsafe { state_ptr.as_mut() }) else {
-            return;
-        };
         let location = self.convertPoint_fromView(event.locationInWindow(), None);
-        let hover = tab_bar_hit(location, self.bounds(), state.sessions.len());
-        if hover != state.tab_bar_hover {
+        let bounds = self.bounds();
+        let changed = {
+            let mut state = self.ivars().state.borrow_mut();
+            let hover = tab_bar_hit(location, bounds, state.sessions.len());
+            let changed = hover != state.tab_bar_hover;
             state.tab_bar_hover = hover;
+            changed
+        };
+        if changed {
             self.setNeedsDisplay(true);
         }
     }
@@ -498,30 +463,13 @@ impl ShittyTerminalView {
     /// Drain a bounded PTY output batch and request a redraw. Returns true
     /// when another event is needed to continue draining a large burst.
     pub(in crate::mac_app) fn pty_output_ready(&self) -> bool {
-        let state_ptr = self.ivars().state;
-        if state_ptr.is_null() {
-            return false;
-        }
-        let state = unsafe { &mut *state_ptr };
+        let mut state = self.ivars().state.borrow_mut();
         let needs_follow_up = state.drain_pty_output();
-        self.redraw_grid_if_changed(state);
+        self.redraw_grid_if_changed(&mut state);
         needs_follow_up
     }
 }
 
 pub(in crate::mac_app) struct TerminalViewIvars {
-    pub(in crate::mac_app) state: *mut TerminalViewState,
-    /// Clone of the event bridge inside the state, for the PTY reader thread.
-    pub(in crate::mac_app) wake: Retained<ViewWake>,
-}
-
-// Drop impl ensures the boxed TerminalViewState is freed when the ObjC view
-// is deallocated by ARC, which also detaches queued event callbacks.
-impl Drop for TerminalViewIvars {
-    fn drop(&mut self) {
-        if !self.state.is_null() {
-            unsafe { drop(Box::from_raw(self.state)) };
-            self.state = std::ptr::null_mut();
-        }
-    }
+    pub(in crate::mac_app) state: RefCell<TerminalViewState>,
 }

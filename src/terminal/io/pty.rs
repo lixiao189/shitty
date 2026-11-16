@@ -1,3 +1,4 @@
+use nix::errno::Errno;
 use nix::libc::{
     SIGHUP, SIGWINCH, TIOCSCTTY, TIOCSWINSZ, getpwuid, getuid, ioctl, killpg, pid_t, setsid,
     tcgetpgrp, winsize,
@@ -6,7 +7,7 @@ use nix::pty::openpty;
 use nix::unistd::{read, write};
 use std::error::Error;
 use std::ffi::{CStr, OsStr, OsString};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -30,7 +31,7 @@ impl Pty {
     /// Open a fresh PTY and start the login shell inside it.
     pub(crate) fn spawn() -> Result<Self, Box<dyn Error>> {
         let pty = openpty(None, None)?;
-        let shell_pgid = spawn_shell(&pty.slave);
+        let shell_pgid = spawn_shell(&pty.slave)?;
         Ok(Self {
             master: pty.master,
             shell_pgid,
@@ -49,19 +50,24 @@ impl Pty {
         rx_input: Receiver<PtyEvent>,
         on_output: impl Fn() + Send + 'static,
         on_exit: impl Fn() + Send + 'static,
-    ) {
-        let master_read = self.master.try_clone().expect("master fd clone failed");
-        let master_write = self.master.try_clone().expect("master fd clone failed");
+    ) -> Result<(), Box<dyn Error>> {
+        let master_read = self.master.try_clone()?;
+        let master_write = self.master.try_clone()?;
         let shell_pgid = self.shell_pgid;
 
         thread::spawn(move || {
             loop {
                 let mut buffer = [0u8; 8192];
                 match read(master_read.as_fd(), &mut buffer) {
-                    Ok(0) | Err(_) => {
+                    Ok(0) => {
                         // EOF means every process holding the slave side has
                         // exited (e.g. ^D closed the login shell), so the
                         // session is over.
+                        on_exit();
+                        break;
+                    }
+                    Err(Errno::EINTR) => continue,
+                    Err(_) => {
                         on_exit();
                         break;
                     }
@@ -79,11 +85,11 @@ impl Pty {
             // The last size applied to the PTY, so repeated/coalesced resize
             // events do not spam the shell with redundant SIGWINCH redraws.
             let mut last_resize: Option<(u16, u16)> = None;
-            while let Ok(event) = rx_input.recv() {
+            'writer: while let Ok(event) = rx_input.recv() {
                 match event {
                     PtyEvent::Input(bytes) => {
-                        if write(master_write.as_fd(), &bytes).is_err() {
-                            break;
+                        if write_all(master_write.as_fd(), &bytes).is_err() {
+                            break 'writer;
                         }
                     }
                     PtyEvent::Resize { cols, rows } => {
@@ -107,14 +113,16 @@ impl Pty {
                             last_resize = Some((cols, rows));
                         }
                         for bytes in queued_inputs {
-                            if write(master_write.as_fd(), &bytes).is_err() {
-                                break;
+                            if write_all(master_write.as_fd(), &bytes).is_err() {
+                                break 'writer;
                             }
                         }
                     }
                 }
             }
         });
+
+        Ok(())
     }
 
     /// Hang up the shell and its foreground job so the reader thread sees EOF
@@ -122,14 +130,29 @@ impl Pty {
     pub(crate) fn terminate(&self) {
         let fd = self.master.as_raw_fd();
         let foreground_pgid = unsafe { tcgetpgrp(fd) };
-        for pgid in [self.shell_pgid, foreground_pgid] {
-            if pgid > 0 {
-                unsafe {
-                    let _ = killpg(pgid, SIGHUP);
-                }
+        if self.shell_pgid > 0 {
+            unsafe {
+                let _ = killpg(self.shell_pgid, SIGHUP);
+            }
+        }
+        if foreground_pgid > 0 && foreground_pgid != self.shell_pgid {
+            unsafe {
+                let _ = killpg(foreground_pgid, SIGHUP);
             }
         }
     }
+}
+
+fn write_all(fd: BorrowedFd<'_>, mut bytes: &[u8]) -> Result<(), Errno> {
+    while !bytes.is_empty() {
+        match write(fd, bytes) {
+            Ok(0) => return Err(Errno::EIO),
+            Ok(n) => bytes = &bytes[n..],
+            Err(Errno::EINTR) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 impl Drop for Pty {
@@ -193,8 +216,8 @@ fn shell_env(lang: Option<OsString>) -> Vec<(&'static str, OsString)> {
 
 /// Spawn `/bin/zsh` as a login shell in the user's home directory, as the
 /// controlling process of the PTY; returns its pid.
-fn spawn_shell(slave_fd: &OwnedFd) -> pid_t {
-    let ctty_fd = slave_fd.try_clone().expect("slave fd clone failed");
+fn spawn_shell(slave_fd: &OwnedFd) -> Result<pid_t, Box<dyn Error>> {
+    let ctty_fd = slave_fd.try_clone()?;
     let mut command = Command::new("/bin/zsh");
     // A leading `-` in argv[0] makes zsh a login shell, as Terminal.app does,
     // so `.zprofile` (Homebrew's PATH setup, …) runs even when launched from
@@ -207,22 +230,21 @@ fn spawn_shell(slave_fd: &OwnedFd) -> pid_t {
     }
     let mut child = unsafe {
         command
-            .stdin(slave_fd.try_clone().expect("slave fd clone failed"))
-            .stdout(slave_fd.try_clone().expect("slave fd clone failed"))
-            .stderr(slave_fd.try_clone().expect("slave fd clone failed"))
+            .stdin(slave_fd.try_clone()?)
+            .stdout(slave_fd.try_clone()?)
+            .stderr(slave_fd.try_clone()?)
             .pre_exec(move || {
                 let _ = setsid();
                 let _ = ioctl(ctty_fd.as_raw_fd(), TIOCSCTTY as _, 0);
                 Ok(())
             })
-            .spawn()
-    }
-    .expect("Failed to spawn shell");
+            .spawn()?
+    };
     let pid = child.id() as i32;
     thread::spawn(move || {
         let _ = child.wait();
     });
-    pid
+    Ok(pid)
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_app_kit::{
     NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSBezierPath, NSColor, NSFont,
-    NSLineCapStyle, NSStringDrawing,
+    NSGraphicsContext, NSLineCapStyle, NSStringDrawing,
 };
 use objc2_foundation::{
     NSArray, NSAttributedStringKey, NSMutableDictionary, NSPoint, NSRect, NSSize, NSString,
@@ -90,6 +90,12 @@ pub(in crate::mac_app) fn paint_tab_bar(state: &TerminalViewState, bounds: NSRec
     let font = NSFont::systemFontOfSize(TAB_FONT_SIZE);
     let font_height = font.ascender() - font.descender();
 
+    NSGraphicsContext::saveGraphicsState_class();
+    NSBezierPath::clipRect(NSRect::new(
+        bar.origin,
+        NSSize::new(tabs_area_width(bounds), bar.size.height),
+    ));
+
     for (index, session) in state.sessions.iter().enumerate() {
         let rect = tab_rect(index, bounds, tab_count);
         if rect.origin.x >= tabs_right {
@@ -140,6 +146,8 @@ pub(in crate::mac_app) fn paint_tab_bar(state: &TerminalViewState, bounds: NSRec
         }
     }
 
+    NSGraphicsContext::restoreGraphicsState_class();
+
     let plus_rect = new_tab_rect(bounds);
     fill_rect(
         NSRect::new(
@@ -158,12 +166,11 @@ pub(in crate::mac_app) fn paint_tab_bar(state: &TerminalViewState, bounds: NSRec
     );
     let top = bar.origin.y + bar.size.height - 1.0;
     let active = tab_rect(state.active, bounds, tab_count);
+    let active_x0 = active.origin.x.clamp(bar.origin.x, tabs_right);
+    let active_x1 = (active.origin.x + active.size.width).clamp(bar.origin.x, tabs_right);
     for (x0, x1) in [
-        (bar.origin.x, active.origin.x),
-        (
-            active.origin.x + active.size.width,
-            bar.origin.x + bar.size.width,
-        ),
+        (bar.origin.x, active_x0),
+        (active_x1, bar.origin.x + bar.size.width),
     ] {
         if x1 > x0 {
             fill_rect(

@@ -21,7 +21,9 @@ pub(in crate::mac_app) fn asset_path(rel: &str) -> std::path::PathBuf {
     }
 }
 
-/// Reinterpret any reference as an Objective-C `AnyObject` reference.
-pub(in crate::mac_app) fn cast_any_object<T: ?Sized>(obj: &T) -> &objc2::runtime::AnyObject {
+/// Reinterpret any Objective-C object reference as an `AnyObject` reference.
+pub(in crate::mac_app) fn cast_any_object<T: ?Sized + objc2::Message>(
+    obj: &T,
+) -> &objc2::runtime::AnyObject {
     unsafe { &*(obj as *const T as *const objc2::runtime::AnyObject) }
 }

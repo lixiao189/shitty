@@ -85,13 +85,10 @@ impl TerminalViewState {
 impl ShittyTerminalView {
     /// Open a tab sized to the current view. The new tab always makes the
     /// strip visible, so the session starts at the shrunken size.
-    pub(in crate::mac_app) fn create_tab(&self, state: &mut TerminalViewState) {
-        let (cols, rows) = grid_size_for(
-            self.bounds().size,
-            state.cell_width,
-            state.cell_height,
-            true,
-        );
+    pub(in crate::mac_app) fn create_tab(&self) {
+        let bounds_size = self.bounds().size;
+        let mut state = self.ivars().state.borrow_mut();
+        let (cols, rows) = grid_size_for(bounds_size, state.cell_width, state.cell_height, true);
         match state.spawn_session(cols, rows) {
             Ok(()) => {
                 state
@@ -100,7 +97,7 @@ impl ShittyTerminalView {
                     .expect("spawn_session pushes the new tab")
                     .send_resize(cols, rows);
                 // A second tab reveals the strip, which shrinks the terminal.
-                self.resize_grid_now(state);
+                self.resize_grid_now(&mut state);
             }
             Err(error) => eprintln!("failed to create tab: {error}"),
         }
@@ -108,65 +105,65 @@ impl ShittyTerminalView {
 
     /// Close the focused tab, or the window when it is the last one.
     pub(in crate::mac_app) fn close_active_tab(&self) {
-        let state_ptr = self.ivars().state;
-        let Some(state) = (unsafe { state_ptr.as_mut() }) else {
-            return;
-        };
-        let index = state.active;
-        self.close_tab_at(state, index);
+        let index = self.ivars().state.borrow().active;
+        self.close_tab_at(index);
     }
 
     /// Close `index`, or the window when it is the last tab.
-    pub(in crate::mac_app) fn close_tab_at(&self, state: &mut TerminalViewState, index: usize) {
-        if state.close_tab(index) {
-            self.resize_grid_now(state);
-        } else {
+    pub(in crate::mac_app) fn close_tab_at(&self, index: usize) {
+        let closed = {
+            let mut state = self.ivars().state.borrow_mut();
+            if state.close_tab(index) {
+                self.resize_grid_now(&mut state);
+                true
+            } else {
+                false
+            }
+        };
+        if !closed {
             self.close_window();
-        }
-    }
-
-    /// Focus `index` and repaint when the focus actually moved.
-    pub(in crate::mac_app) fn focus_tab(&self, state: &mut TerminalViewState, index: usize) {
-        if state.select_tab(index) {
-            self.setNeedsDisplay(true);
         }
     }
 
     /// Focus the tab `delta` positions away, wrapping around.
     pub(in crate::mac_app) fn select_relative_tab(&self, delta: isize) {
-        let state_ptr = self.ivars().state;
-        let Some(state) = (unsafe { state_ptr.as_mut() }) else {
-            return;
+        let changed = {
+            let mut state = self.ivars().state.borrow_mut();
+            let count = state.sessions.len();
+            if count < 2 {
+                false
+            } else {
+                let next = (state.active as isize + delta).rem_euclid(count as isize) as usize;
+                state.select_tab(next)
+            }
         };
-        let count = state.sessions.len();
-        if count < 2 {
-            return;
+        if changed {
+            self.setNeedsDisplay(true);
         }
-        let next = (state.active as isize + delta).rem_euclid(count as isize) as usize;
-        self.focus_tab(state, next);
     }
 
     /// Focus the tab at `index`; out-of-range indices are ignored so only
     /// the first nine tabs have a ⌘1–⌘9 shortcut.
     pub(in crate::mac_app) fn select_tab_at(&self, index: usize) {
-        let state_ptr = self.ivars().state;
-        let Some(state) = (unsafe { state_ptr.as_mut() }) else {
-            return;
-        };
-        self.focus_tab(state, index);
+        if self.ivars().state.borrow_mut().select_tab(index) {
+            self.setNeedsDisplay(true);
+        }
     }
 
     /// Called when a shell exits: drop its tab, or close the window when no
     /// session is left.
     pub(in crate::mac_app) fn session_exited(&self) {
-        let state_ptr = self.ivars().state;
-        let Some(state) = (unsafe { state_ptr.as_mut() }) else {
-            return;
+        let all_exited = {
+            let mut state = self.ivars().state.borrow_mut();
+            if state.remove_exited_sessions() {
+                true
+            } else {
+                self.resize_grid_now(&mut state);
+                false
+            }
         };
-        if state.remove_exited_sessions() {
+        if all_exited {
             self.close_window();
-        } else {
-            self.resize_grid_now(state);
         }
     }
 }
@@ -203,7 +200,13 @@ pub(in crate::mac_app) fn handle_tab_index_key(event: &NSEvent) -> Option<usize>
 }
 
 fn tab_index_shortcut(characters: &str, modifiers: NSEventModifierFlags) -> Option<usize> {
-    if !modifiers.contains(NSEventModifierFlags::Command) {
+    let mods = modifiers.intersection(
+        NSEventModifierFlags::Command
+            | NSEventModifierFlags::Shift
+            | NSEventModifierFlags::Option
+            | NSEventModifierFlags::Control,
+    );
+    if mods != NSEventModifierFlags::Command {
         return None;
     }
     let mut chars = characters.chars();
@@ -265,6 +268,14 @@ mod tests {
 
         assert_eq!(tab_index_shortcut("0", command), None);
         assert_eq!(tab_index_shortcut("1", NSEventModifierFlags::empty()), None);
+        assert_eq!(
+            tab_index_shortcut("1", command | NSEventModifierFlags::Shift),
+            None
+        );
+        assert_eq!(
+            tab_index_shortcut("1", command | NSEventModifierFlags::Option),
+            None
+        );
         assert_eq!(tab_index_shortcut("!", command), None);
         assert_eq!(tab_index_shortcut("12", command), None);
         assert_eq!(tab_index_shortcut("", command), None);

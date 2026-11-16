@@ -66,7 +66,7 @@ impl TerminalSession {
         pty.spawn_threads(tx_output, rx_input, on_output, move || {
             exited_flag.store(true, Ordering::Release);
             on_exit();
-        });
+        })?;
 
         Ok(Self {
             id,
@@ -124,7 +124,9 @@ impl TerminalSession {
     /// Stdin for the shell; any keystroke snaps the view back to the live screen.
     pub(crate) fn send_input(&mut self, bytes: Vec<u8>) {
         if !bytes.is_empty() {
-            self.grid.scroll_to(0);
+            if self.grid.scroll_to(0) {
+                self.selection = None;
+            }
             let _ = self.tx_input.send(PtyEvent::Input(bytes));
         }
     }

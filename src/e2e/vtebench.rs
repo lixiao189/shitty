@@ -1,7 +1,7 @@
 //! vtebench workloads (`third_party/vtebench`) driven through a real session.
 //!
 //! Each benchmark runs the way vtebench runs it: the `benchmark` script's
-//! output is captured once, repeated up to [`MIN_PAYLOAD_BYTES`], and written
+//! output is captured once, repeated up to [`DEFAULT_PAYLOAD_BYTES`], and written
 //! to the terminal after `setup`. The test then checks the screen the
 //! workload leaves behind and that the shell is still usable afterwards.
 

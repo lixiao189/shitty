@@ -98,17 +98,10 @@ impl TerminalGrid {
                 // absorb blank cells (or vice versa), otherwise distant text
                 // would collapse into a single run drawn at the wrong column.
                 && prev.text.is_empty() == run.text.is_empty()
-                // Keep whitespace-only cells separate from each other and from
-                // real text. The grid cannot distinguish an explicitly typed
-                // space from an untouched cell in the occupied prefix, so this
-                // preserves the old rendering where leading spaces were
-                // individual runs.
-                && (!prev.text.is_empty() && prev.text.trim().is_empty())
-                    == (!run.text.is_empty() && run.text.trim().is_empty())
-                && (prev.text.is_empty()
-                    || run.text.is_empty()
-                    || !prev.text.trim().is_empty()
-                    || !run.text.trim().is_empty())
+                // Keep whitespace-only cells separate from graphic text so
+                // explicitly spaced runs keep their boundaries while adjacent
+                // styled spaces (e.g. padded statuslines) still merge.
+                && prev.text.trim().is_empty() == run.text.trim().is_empty()
             {
                 prev.text.push_str(&run.text);
                 prev.width += run.width;
@@ -287,5 +280,17 @@ mod tests {
         assert_eq!(at_run.width, 2);
         // Blank cells sit between the two runs.
         assert!(runs.iter().any(|r| r.text.is_empty()));
+    }
+
+    #[test]
+    fn row_runs_merges_adjacent_styled_spaces() {
+        let mut grid = TerminalGrid::new(6, 1);
+        grid.process_pty_bytes(b"\x1b[41m   \x1b[0m");
+        let runs = grid.row_runs(0);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].col, 0);
+        assert_eq!(runs[0].width, 3);
+        assert_eq!(runs[0].text, "   ");
+        assert!(runs[1].text.is_empty());
     }
 }

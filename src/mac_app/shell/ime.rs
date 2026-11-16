@@ -1,7 +1,7 @@
 //! Input-method (IME) composition state.
 //!
 //! The `NSTextInputClient` methods live with the view class in
-//! [`super::terminal_view`]; this module owns the state transitions they drive
+//! [`super::view`]; this module owns the state transitions they drive
 //! and the AppKit object conversions they need.
 
 use objc2::rc::autoreleasepool;
@@ -43,6 +43,9 @@ impl TerminalViewState {
         self.marked_text = text;
         self.ime_composing = !self.marked_text.is_empty();
         self.had_composition = false;
+        if self.ime_composing && self.active_mut().scroll_to(0) {
+            self.active_mut().selection = None;
+        }
     }
 
     /// Drop the marked text after the input method cancels it.
